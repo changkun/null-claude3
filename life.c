@@ -65,6 +65,9 @@
  *   %           Toggle renormalization group flow (multi-scale structure)
  *                 Majority-rule block decimation at 2x, 4x, 8x scales
  *                 Cyan=fine, yellow=meso, magenta=coarse, white=scale-invariant
+ *   ^           Toggle Kolmogorov complexity estimator (algorithmic complexity)
+ *                 LZ77-style compression of local neighborhoods
+ *                 Blue=compressible, gold=structured, red=incompressible
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -431,6 +434,37 @@ static float rg_hist_crit[RG_HIST_LEN]; /* criticality history */
 static float rg_hist_d[RG_N_SCALES][RG_HIST_LEN]; /* density per scale history */
 static int   rg_hist_idx = 0;
 static int   rg_hist_count = 0;
+
+/* ── Kolmogorov Complexity Estimator ──────────────────────────────────────── */
+/* Estimate per-cell algorithmic complexity via LZ77-style compression of
+   local neighborhoods.  For each cell, serialize a 16×16 block into a
+   bitstring and compress using a sliding-window dictionary search.
+   Complexity = compressed_bits / raw_bits (compression ratio).
+   Low ratio = highly compressible (algorithmically simple: uniform, periodic);
+   High ratio = incompressible (algorithmically complex: random-looking).
+   This is fundamentally different from Shannon entropy: entropy measures
+   statistical disorder, Kolmogorov complexity measures descriptional richness.
+   A perfect checkerboard has max entropy but near-zero K-complexity. */
+#define KC_BLOCK 16         /* neighborhood block size (16×16 = 256 bits) */
+#define KC_WINDOW 64        /* LZ77 sliding window size (bits to search back) */
+#define KC_MIN_MATCH 3      /* minimum match length for LZ77 */
+#define KC_HIST_LEN 64      /* sparkline history length */
+
+static float kc_grid[MAX_H][MAX_W];     /* per-cell complexity ratio 0.0–1.0 */
+static int   kc_mode = 0;               /* 0=off, 1=on */
+static int   kc_stale = 1;              /* 1=needs recomputation */
+static float kc_global_mean = 0.0f;     /* mean complexity across alive cells */
+static float kc_global_max = 0.0f;      /* max complexity found */
+static float kc_global_min = 1.0f;      /* min complexity found */
+static int   kc_n_simple = 0;           /* cells with ratio < 0.3 */
+static int   kc_n_structured = 0;       /* cells with ratio 0.3–0.7 */
+static int   kc_n_complex = 0;          /* cells with ratio > 0.7 */
+
+/* Sparkline history */
+static float kc_hist_mean[KC_HIST_LEN];
+static float kc_hist_max[KC_HIST_LEN];
+static int   kc_hist_idx = 0;
+static int   kc_hist_count = 0;
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1316,6 +1350,7 @@ static void grid_step(void) {
     cplx_stale = 1;
     topo_stale = 1;
     rg_stale = 1;
+    kc_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -4449,6 +4484,145 @@ static RGB rg_to_rgb(float dominant_scale, float invariance) {
     }
 }
 
+/* ── Kolmogorov Complexity Estimator computation ─────────────────────────── */
+
+/* LZ77-style compression of a bitstring: returns compressed size as fraction
+   of original size (0.0 = perfectly compressible, 1.0 = incompressible).
+   Uses a sliding window to find longest matches in previously seen data. */
+static float kc_lz_compress(const unsigned char *bits, int len) {
+    if (len <= 0) return 0.0f;
+
+    int pos = 0;          /* current position in bitstring */
+    int output_bits = 0;  /* total bits in compressed output */
+
+    /* Encoding: for each position, either emit a literal (1 + 1 bit)
+       or a back-reference (1 + log2(offset) + log2(length) bits).
+       This is a simplified LZ77 model for estimation purposes. */
+    while (pos < len) {
+        int best_len = 0;
+        int search_start = pos - KC_WINDOW;
+        if (search_start < 0) search_start = 0;
+
+        /* Search for longest match in sliding window */
+        for (int s = search_start; s < pos; s++) {
+            int match_len = 0;
+            while (pos + match_len < len && match_len < 255 &&
+                   bits[s + match_len] == bits[pos + match_len]) {
+                match_len++;
+                /* Allow overlapping: s + match_len can go past pos */
+            }
+            if (match_len > best_len) {
+                best_len = match_len;
+            }
+        }
+
+        if (best_len >= KC_MIN_MATCH) {
+            /* Back-reference: flag(1) + offset cost (~5 bits) + length cost (~4 bits) */
+            output_bits += 10;
+            pos += best_len;
+        } else {
+            /* Literal: flag(1) + raw bit(1) */
+            output_bits += 2;
+            pos++;
+        }
+    }
+
+    float ratio = (float)output_bits / (float)(len > 0 ? len : 1);
+    if (ratio > 1.0f) ratio = 1.0f;
+    return ratio;
+}
+
+static void kc_compute(void) {
+    int half = KC_BLOCK / 2;  /* 8: half-block for centering */
+    float total_kc = 0.0f;
+    float max_kc = 0.0f;
+    float min_kc = 1.0f;
+    int n_alive = 0;
+    int n_simple = 0, n_struct = 0, n_complex = 0;
+
+    /* Temporary bitstring buffer for one block */
+    unsigned char block_bits[KC_BLOCK * KC_BLOCK];
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (grid[y][x] == 0) {
+                kc_grid[y][x] = 0.0f;
+                continue;
+            }
+
+            /* Serialize KC_BLOCK × KC_BLOCK neighborhood centered on (x,y) */
+            int n_bits = 0;
+            for (int dy = -half; dy < half; dy++) {
+                for (int dx = -half; dx < half; dx++) {
+                    int nx = x + dx, ny = y + dy;
+                    unsigned char val = 0;
+                    if (nx >= 0 && nx < W && ny >= 0 && ny < H) {
+                        val = grid[ny][nx] > 0 ? 1 : 0;
+                    }
+                    block_bits[n_bits++] = val;
+                }
+            }
+
+            /* Compress and compute ratio */
+            float ratio = kc_lz_compress(block_bits, n_bits);
+            kc_grid[y][x] = ratio;
+            total_kc += ratio;
+            n_alive++;
+
+            if (ratio > max_kc) max_kc = ratio;
+            if (ratio < min_kc) min_kc = ratio;
+
+            if (ratio < 0.3f) n_simple++;
+            else if (ratio <= 0.7f) n_struct++;
+            else n_complex++;
+        }
+    }
+
+    kc_global_mean = n_alive > 0 ? total_kc / n_alive : 0.0f;
+    kc_global_max = max_kc;
+    kc_global_min = n_alive > 0 ? min_kc : 0.0f;
+    kc_n_simple = n_simple;
+    kc_n_structured = n_struct;
+    kc_n_complex = n_complex;
+
+    /* Record sparkline history */
+    kc_hist_mean[kc_hist_idx] = kc_global_mean;
+    kc_hist_max[kc_hist_idx] = kc_global_max;
+    kc_hist_idx = (kc_hist_idx + 1) % KC_HIST_LEN;
+    if (kc_hist_count < KC_HIST_LEN) kc_hist_count++;
+
+    kc_stale = 0;
+}
+
+/* Kolmogorov complexity color: blue (simple) → gold (structured) → red/white (complex) */
+static RGB kc_to_rgb(float ratio) {
+    if (ratio < 0.3f) {
+        /* Simple: deep blue → cyan */
+        float t = ratio / 0.3f;
+        return (RGB){(unsigned char)(20 + 30 * t),
+                     (unsigned char)(40 + 120 * t),
+                     (unsigned char)(180 + 40 * t)};
+    } else if (ratio < 0.6f) {
+        /* Structured: cyan → gold */
+        float t = (ratio - 0.3f) / 0.3f;
+        return (RGB){(unsigned char)(50 + 190 * t),
+                     (unsigned char)(160 + 50 * t),
+                     (unsigned char)(220 - 190 * t)};
+    } else if (ratio < 0.85f) {
+        /* Complex: gold → red */
+        float t = (ratio - 0.6f) / 0.25f;
+        return (RGB){(unsigned char)(240),
+                     (unsigned char)(210 - 160 * t),
+                     (unsigned char)(30 + 20 * t)};
+    } else {
+        /* Incompressible: red → white-hot */
+        float t = (ratio - 0.85f) / 0.15f;
+        return (RGB){(unsigned char)(240 + 15 * t),
+                     (unsigned char)(50 + 200 * t),
+                     (unsigned char)(50 + 200 * t)};
+    }
+}
+
 /* ── Mutual Information Network computation ──────────────────────────────── */
 
 /* Draw a Bresenham line on mi_overlay, keeping max MI at each cell */
@@ -6259,6 +6433,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Kolmogorov complexity estimator overlay: algorithmic complexity */
+    if (kc_mode) {
+        float k = kc_grid[y][x];
+        if (k > 0.005f || grid[y][x]) {
+            *out = kc_to_rgb(k);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 22; /* 22 = kc ghost */
+        }
+        return 0;
+    }
+
     /* Renormalization group flow overlay: multi-scale structure */
     if (rg_mode) {
         if (grid[y][x]) {
@@ -6528,6 +6717,12 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rg_str, sizeof(rg_str),
                  " \033[38;2;100;220;200m\xe2\x97\x86RG:C=%.2f\033[0m", rg_criticality);
 
+    /* Kolmogorov complexity indicator */
+    char kc_str[96] = "";
+    if (kc_mode)
+        snprintf(kc_str, sizeof(kc_str),
+                 " \033[38;2;240;180;40m\xe2\x97\x86KC:%.2f\033[0m", kc_global_mean);
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -6648,9 +6843,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -8907,6 +9102,149 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rrst);
     }
 
+    /* ── Kolmogorov Complexity Estimator overlay panel ────────────────────── */
+    if (kc_mode) {
+        int kp_w = 44;
+        int kp_col = term_cols - kp_w - 2;
+        /* Stack below other active panels */
+        int kp_row = 3;
+        if (entropy_mode)   kp_row += 8;
+        if (temp_mode)      kp_row += 9;
+        if (lyapunov_mode)  kp_row += 8;
+        if (fourier_mode)   kp_row += 18;
+        if (fractal_mode)   kp_row += 11;
+        if (wolfram_mode)   kp_row += 14;
+        if (flow_mode)      kp_row += 9;
+        if (attractor_mode) kp_row += 8;
+        if (cone_mode >= 1) kp_row += 8;
+        if (surp_mode)      kp_row += 8;
+        if (mi_mode)        kp_row += 12;
+        if (cplx_mode)      kp_row += 11;
+        if (topo_mode)      kp_row += 11;
+        if (rg_mode)        kp_row += 11;
+        if (kp_col < 1) kp_col = 1;
+
+        const char *kbdr = "\033[38;2;240;180;40;48;2;12;10;4m";
+        const char *kbg  = "\033[48;2;12;10;4m";
+        const char *krst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 K-Complexity \xe2\x97\x86 ",
+                     kp_row, kp_col, kbdr);
+        for (int i = 19; i < kp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", krst);
+
+        /* Row 1: Mean complexity */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     kp_row + 1, kp_col, kbdr, kbg);
+        p += sprintf(p, " \033[38;2;240;180;40mMean K: \033[1;38;2;");
+        if (kc_global_mean < 0.3f) p += sprintf(p, "60;160;220m");
+        else if (kc_global_mean < 0.7f) p += sprintf(p, "240;200;40m");
+        else p += sprintf(p, "240;80;60m");
+        p += sprintf(p, "%.3f", kc_global_mean);
+        p += sprintf(p, "\033[0;38;2;140;120;60m  max:");
+        p += sprintf(p, "\033[38;2;240;120;80m%.3f", kc_global_max);
+        { int used = 30; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", kbdr, krst);
+
+        /* Row 2: Distribution bar */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     kp_row + 2, kp_col, kbdr, kbg);
+        p += sprintf(p, " \033[38;2;180;150;80mDistribution: ");
+        {
+            int total = kc_n_simple + kc_n_structured + kc_n_complex;
+            int bar_w = kp_w - 17;
+            if (total > 0) {
+                int b_simp = (kc_n_simple * bar_w) / total;
+                int b_stru = (kc_n_structured * bar_w) / total;
+                int b_comp = bar_w - b_simp - b_stru;
+                if (b_comp < 0) b_comp = 0;
+                for (int i = 0; i < b_simp; i++)
+                    p += sprintf(p, "\033[38;2;60;160;220m\xe2\x96\x88");
+                for (int i = 0; i < b_stru; i++)
+                    p += sprintf(p, "\033[38;2;240;200;40m\xe2\x96\x88");
+                for (int i = 0; i < b_comp; i++)
+                    p += sprintf(p, "\033[38;2;240;80;60m\xe2\x96\x88");
+            } else {
+                for (int i = 0; i < bar_w; i++)
+                    p += sprintf(p, "\033[38;2;30;25;10m\xe2\x96\x91");
+            }
+        }
+        p += sprintf(p, " ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", kbdr, krst);
+
+        /* Row 3: Class counts */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     kp_row + 3, kp_col, kbdr, kbg);
+        p += sprintf(p, " \033[38;2;60;160;220mSimple:%d \033[38;2;240;200;40mStruct:%d \033[38;2;240;80;60mComplex:%d",
+                     kc_n_simple, kc_n_structured, kc_n_complex);
+        { int used = 34; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", kbdr, krst);
+
+        /* Row 4: Compressibility interpretation */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     kp_row + 4, kp_col, kbdr, kbg);
+        {
+            int total = kc_n_simple + kc_n_structured + kc_n_complex;
+            float simp_pct = total > 0 ? (float)kc_n_simple * 100.0f / total : 0;
+            float comp_pct = total > 0 ? (float)kc_n_complex * 100.0f / total : 0;
+            p += sprintf(p, " \033[38;2;160;140;80mCompressible:%.0f%% Random:%.0f%%",
+                         simp_pct, comp_pct);
+        }
+        { int used = 30; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", kbdr, krst);
+
+        /* Row 5: Min complexity */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     kp_row + 5, kp_col, kbdr, kbg);
+        p += sprintf(p, " \033[38;2;140;120;60mMin K: \033[38;2;60;160;220m%.3f",
+                     kc_global_min);
+        p += sprintf(p, " \033[38;2;100;80;40m(most compressible)");
+        { int used = 34; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", kbdr, krst);
+
+        /* Row 6: Sparkline — mean complexity over time */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     kp_row + 6, kp_col, kbdr, kbg);
+        p += sprintf(p, " \033[38;2;140;120;60mK ");
+        if (kc_hist_count > 1) {
+            int n = kc_hist_count < 30 ? kc_hist_count : 30;
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            for (int i = 0; i < n; i++) {
+                int idx = (kc_hist_idx - n + i + KC_HIST_LEN) % KC_HIST_LEN;
+                int lvl = (int)(kc_hist_mean[idx] * 7.0f);
+                if (lvl < 0) lvl = 0;
+                if (lvl > 7) lvl = 7;
+                if (kc_hist_mean[idx] < 0.3f)
+                    p += sprintf(p, "\033[38;2;60;160;220m%s", spark_chars[lvl]);
+                else if (kc_hist_mean[idx] < 0.7f)
+                    p += sprintf(p, "\033[38;2;240;200;40m%s", spark_chars[lvl]);
+                else
+                    p += sprintf(p, "\033[38;2;240;80;60m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", kbg);
+        { int used = 4 + (kc_hist_count < 30 ? kc_hist_count : 30);
+          for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", kbdr, krst);
+
+        /* Row 7: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     kp_row + 7, kp_col, kbdr, kbg);
+        p += sprintf(p, " \033[38;2;100;80;40m[^]toggle  LZ77 compression ratio");
+        { int used = 37; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", kbdr, krst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", kp_row + 8, kp_col, kbdr);
+        for (int i = 0; i < kp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", krst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -9439,6 +9777,12 @@ int main(int argc, char **argv) {
                 rg_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '^') {
+            kc_mode = !kc_mode;
+            if (kc_mode) {
+                kc_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -9900,6 +10244,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh RG flow every 4 generations */
         if (rg_mode && rg_stale && (generation % 4 == 0 || !running)) {
             rg_compute();
+        }
+
+        /* Auto-refresh Kolmogorov complexity every 4 generations */
+        if (kc_mode && kc_stale && (generation % 4 == 0 || !running)) {
+            kc_compute();
         }
 
         render(running, speed_ms, draw_mode);
