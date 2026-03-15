@@ -17,6 +17,8 @@
  *   m           Mutate — randomly flip one birth/survival bit
  *   k           Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope)
  *   j           Toggle zone-paint mode (paint regions with different rulesets)
+ *   e           Toggle emitter/absorber mode (left=emitter, right=absorber, middle=remove)
+ *                 [/] cycle emit pattern, +/- adjust rate/radius in this mode
  *   z / x       Zoom in / out (3 levels: 1x, 2x half-block, 4x quarter)
  *   n           Toggle minimap overlay (shows full grid + viewport rect when zoomed)
  *   Arrow keys  Pan viewport across the full 400×200 grid
@@ -68,6 +70,150 @@ static int show_minimap = 1; /* minimap overlay when zoomed */
 static int zone_mode = 0; /* 0=off, 1=zone-paint mode */
 static int zone_brush = 0; /* which ruleset to paint in zone mode */
 static int zone_enabled = 0; /* whether per-cell zones are active */
+
+/* Forward declarations for emitter/absorber use */
+static void grid_set(int x, int y);
+static void grid_unset(int x, int y);
+
+/* ── Emitters & Absorbers (sources/sinks) ─────────────────────────────────── */
+
+#define MAX_EMITTERS 32
+#define MAX_ABSORBERS 32
+
+typedef struct {
+    int x, y;       /* grid position */
+    int rate;        /* emit every N generations (1=every step, 5=every 5th) */
+    int pattern;     /* 0=dot, 1=cross, 2=random 3x3, 3=glider */
+} Emitter;
+
+typedef struct {
+    int x, y;       /* grid position */
+    int radius;     /* kill radius (1..6) */
+} Absorber;
+
+static Emitter emitters[MAX_EMITTERS];
+static int n_emitters = 0;
+static Absorber absorbers[MAX_ABSORBERS];
+static int n_absorbers = 0;
+static int emit_mode = 0;      /* 0=off, 1=emitter/absorber placement mode */
+static int emit_pattern = 0;   /* current pattern for new emitters */
+static int emit_rate = 3;      /* current rate for new emitters */
+static int absorb_radius = 3;  /* current radius for new absorbers */
+
+/* Emit patterns into the grid at (cx,cy) */
+static void emitter_fire(Emitter *e) {
+    int cx = e->x, cy = e->y;
+    switch (e->pattern) {
+        case 0: /* dot */
+            grid_set(cx, cy);
+            break;
+        case 1: /* cross */
+            grid_set(cx, cy);
+            grid_set(cx-1, cy); grid_set(cx+1, cy);
+            grid_set(cx, cy-1); grid_set(cx, cy+1);
+            break;
+        case 2: /* random 3x3 */
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++)
+                    if (rand() % 2)
+                        grid_set(cx + dx, cy + dy);
+            break;
+        case 3: /* glider (direction varies by position) */
+            {
+                int d = (cx + cy) % 4;
+                static const int gx[4][5] = {{0,1,2,2,1},{0,0,0,1,-1},{0,-1,-2,-2,-1},{0,0,0,-1,1}};
+                static const int gy[4][5] = {{0,0,0,-1,-2},{0,1,2,2,1},{0,0,0,1,2},{0,-1,-2,-2,-1}};
+                for (int i = 0; i < 5; i++)
+                    grid_set(cx + gx[d][i], cy + gy[d][i]);
+            }
+            break;
+    }
+}
+
+/* Apply absorber: kill all cells within radius */
+static void absorber_apply(Absorber *a) {
+    int r = a->radius;
+    int r2 = r * r;
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+            if (dx*dx + dy*dy <= r2)
+                grid_unset(a->x + dx, a->y + dy);
+}
+
+/* Apply all emitters and absorbers (called after grid_step) */
+static void apply_sources_sinks(void) {
+    for (int i = 0; i < n_emitters; i++) {
+        if (generation % emitters[i].rate == 0)
+            emitter_fire(&emitters[i]);
+    }
+    for (int i = 0; i < n_absorbers; i++) {
+        absorber_apply(&absorbers[i]);
+    }
+}
+
+/* Add emitter (with symmetry) */
+static void add_emitter_at(int x, int y) {
+    if (n_emitters >= MAX_EMITTERS) return;
+    if (x < 0 || x >= W || y < 0 || y >= H) return;
+    /* Don't place duplicate at same position */
+    for (int i = 0; i < n_emitters; i++)
+        if (emitters[i].x == x && emitters[i].y == y) return;
+    emitters[n_emitters++] = (Emitter){ x, y, emit_rate, emit_pattern };
+}
+
+static void add_absorber_at(int x, int y) {
+    if (n_absorbers >= MAX_ABSORBERS) return;
+    if (x < 0 || x >= W || y < 0 || y >= H) return;
+    for (int i = 0; i < n_absorbers; i++)
+        if (absorbers[i].x == x && absorbers[i].y == y) return;
+    absorbers[n_absorbers++] = (Absorber){ x, y, absorb_radius };
+}
+
+/* Remove any emitter or absorber near (x,y) within radius 3 */
+static void remove_source_sink_near(int x, int y) {
+    for (int i = 0; i < n_emitters; i++) {
+        int dx = emitters[i].x - x, dy = emitters[i].y - y;
+        if (dx*dx + dy*dy <= 9) {
+            emitters[i] = emitters[--n_emitters];
+            i--;
+        }
+    }
+    for (int i = 0; i < n_absorbers; i++) {
+        int dx = absorbers[i].x - x, dy = absorbers[i].y - y;
+        if (dx*dx + dy*dy <= 9) {
+            absorbers[i] = absorbers[--n_absorbers];
+            i--;
+        }
+    }
+}
+
+/* Place emitter with symmetry */
+static void place_emitter_sym(int gx, int gy) {
+    int cx = W / 2, cy = H / 2;
+    int dx = gx - cx, dy = gy - cy;
+    add_emitter_at(gx, gy);
+    if (symmetry >= 1) add_emitter_at(cx - dx, gy);
+    if (symmetry >= 2) { add_emitter_at(gx, cy - dy); add_emitter_at(cx - dx, cy - dy); }
+    if (symmetry >= 3) {
+        add_emitter_at(cx+dy, cy+dx); add_emitter_at(cx-dy, cy+dx);
+        add_emitter_at(cx+dy, cy-dx); add_emitter_at(cx-dy, cy-dx);
+    }
+}
+
+static void place_absorber_sym(int gx, int gy) {
+    int cx = W / 2, cy = H / 2;
+    int dx = gx - cx, dy = gy - cy;
+    add_absorber_at(gx, gy);
+    if (symmetry >= 1) add_absorber_at(cx - dx, gy);
+    if (symmetry >= 2) { add_absorber_at(gx, cy - dy); add_absorber_at(cx - dx, cy - dy); }
+    if (symmetry >= 3) {
+        add_absorber_at(cx+dy, cy+dx); add_absorber_at(cx-dy, cy+dx);
+        add_absorber_at(cx+dy, cy-dx); add_absorber_at(cx-dy, cy-dx);
+    }
+}
+
+static const char *emit_pattern_names[] = { "dot", "cross", "rand3", "glider" };
+#define N_EMIT_PATTERNS 4
 
 /* ── Viewport (zoom + pan) ─────────────────────────────────────────────────── */
 
@@ -286,6 +432,11 @@ static void grid_step(void) {
 
     memcpy(grid, next_grid, sizeof(grid));
     generation++;
+
+    /* Apply emitters and absorbers after step */
+    if (n_emitters > 0 || n_absorbers > 0)
+        apply_sources_sinks();
+
     hist_push(population);
 }
 
@@ -864,9 +1015,45 @@ static void render_minimap(char **pp) {
 /* Larger buffer for true-color escape sequences */
 static char render_buf[MAX_H * MAX_W * 40 + 16384];
 
-/* Get cell color for rendering (returns 1 if alive, fills rgb; 2 if ghost; 3 if zone bg) */
+/* Check if (x,y) is near an emitter or absorber. Returns: 4=emitter, 5=absorber, 0=neither */
+static int source_sink_marker(int x, int y, RGB *out) {
+    /* Emitters: bright pulsing cyan/white marker */
+    for (int i = 0; i < n_emitters; i++) {
+        int dx = x - emitters[i].x, dy = y - emitters[i].y;
+        if (dx*dx + dy*dy <= 4) { /* radius ~2 visual marker */
+            /* Pulse based on generation and rate */
+            int phase = generation % (emitters[i].rate * 2);
+            int bright = (phase < emitters[i].rate) ? 255 : 180;
+            *out = (RGB){ (unsigned char)(bright * 3/4), (unsigned char)bright, (unsigned char)bright };
+            return 4;
+        }
+    }
+    /* Absorbers: dark purple/red vortex marker */
+    for (int i = 0; i < n_absorbers; i++) {
+        int dx = x - absorbers[i].x, dy = y - absorbers[i].y;
+        int d2 = dx*dx + dy*dy;
+        int r = absorbers[i].radius;
+        if (d2 <= 4) { /* center marker */
+            *out = (RGB){ 200, 30, 60 };
+            return 5;
+        }
+        /* Show kill radius ring when in emit mode */
+        if (emit_mode && d2 >= (r-1)*(r-1) && d2 <= r*r) {
+            *out = (RGB){ 80, 15, 30 };
+            return 5;
+        }
+    }
+    return 0;
+}
+
+/* Get cell color for rendering (returns 1 if alive, fills rgb; 2 if ghost; 3 if zone bg; 4=emitter; 5=absorber) */
 static int cell_color(int x, int y, RGB *out) {
     if (x < 0 || x >= W || y < 0 || y >= H) return 0;
+
+    /* Source/sink markers take priority for center pixels */
+    int ss = source_sink_marker(x, y, out);
+    if (ss) return ss;
+
     if (grid[y][x]) {
         if (heatmap_mode)
             *out = age_to_rgb(grid[y][x]);
@@ -936,6 +1123,20 @@ static void render(int running, int speed_ms, int draw_mode) {
     const char *map_str = (zoom > 1 && show_minimap)
         ? " \033[94m\u25A3MAP\033[0m" : "";
 
+    /* Emit mode indicator */
+    char emit_str[128] = "";
+    if (emit_mode) {
+        snprintf(emit_str, sizeof(emit_str),
+                 " \033[38;2;180;255;255m\xe2\x97\x89" "EMIT:%s r%d\033[0m"
+                 " \033[38;2;200;30;60m\xe2\x97\x8b" "SINK:r%d\033[0m"
+                 " \033[90m(%dE/%dA)\033[0m",
+                 emit_pattern_names[emit_pattern], emit_rate,
+                 absorb_radius, n_emitters, n_absorbers);
+    } else if (n_emitters > 0 || n_absorbers > 0) {
+        snprintf(emit_str, sizeof(emit_str),
+                 " \033[90m\xe2\x97\x89" "%dE/%dA\033[0m", n_emitters, n_absorbers);
+    }
+
     /* Zone mode indicator */
     char zone_str[80] = "";
     if (zone_mode) {
@@ -963,10 +1164,10 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
                  state, wrap_str, draw_str, heat_str, sym_str, zoom_str, map_str, zone_str,
-                 rule_display, generation, population, speed_ms);
+                 emit_str, rule_display, generation, population, speed_ms);
 
     /* sparkline right after stats */
     if (show_graph && hist_count > 1) {
@@ -979,7 +1180,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
-                     "[/]rule [m]mut [j]zone [z/x]zoom [n]map [\u2190\u2191\u2192\u2193]pan [0]center [q]quit\033[0m\033[K\n");
+                     "[/]rule [m]mut [j]zone [e]emit [z/x]zoom [n]map [\u2190\u2191\u2192\u2193]pan [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
     if (usable_rows < 5) usable_rows = 5;
@@ -998,6 +1199,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                     p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7 \033[0m", c.r, c.g, c.b);
                 } else if (t == 3) {
                     p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
+                } else if (t == 4) {
+                    /* Emitter: bright marker */
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xe2\x97\x89 \033[0m", c.r/3, c.g/3, c.b/3);
+                } else if (t == 5) {
+                    /* Absorber: dark vortex marker */
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xe2\x97\x8b \033[0m", c.r/3, c.g/3, c.b/3);
                 } else {
                     *p++ = ' '; *p++ = ' ';
                 }
@@ -1017,24 +1224,22 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int tt = cell_color(gx, gy_top, &ct);
                 int tb = cell_color(gx, gy_bot, &cb);
 
-                if (tt == 1 && tb == 1) {
-                    /* both alive: fg=top, bg=bottom, print ▀ */
+                /* Treat emitter(4) and absorber(5) as solid colored cells */
+                int tt_solid = (tt == 1 || tt == 4 || tt == 5);
+                int tb_solid = (tb == 1 || tb == 4 || tb == 5);
+                if (tt_solid && tb_solid) {
                     p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
                                  ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
-                } else if (tt == 1 && tb == 3) {
-                    /* top alive, bottom zone bg */
+                } else if (tt_solid && tb == 3) {
                     p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
                                  ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
-                } else if (tb == 1 && tt == 3) {
-                    /* bottom alive, top zone bg */
+                } else if (tb_solid && tt == 3) {
                     p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x84\033[0m",
                                  cb.r, cb.g, cb.b, ct.r, ct.g, ct.b);
-                } else if (tt == 1) {
-                    /* top alive only */
+                } else if (tt_solid) {
                     p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x80\033[0m",
                                  ct.r, ct.g, ct.b);
-                } else if (tb == 1) {
-                    /* bottom alive only: use ▄ (lower half) */
+                } else if (tb_solid) {
                     p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84\033[0m",
                                  cb.r, cb.g, cb.b);
                 } else if (tt == 2 || tb == 2) {
@@ -1095,10 +1300,10 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int tr_t = cell_color(gx1, gy0, &dummy);
                 int bl_t = cell_color(gx0, gy1, &dummy);
                 int br_t = cell_color(gx1, gy1, &dummy);
-                int tl = (tl_t == 1);
-                int tr = (tr_t == 1);
-                int bl = (bl_t == 1);
-                int br = (br_t == 1);
+                int tl = (tl_t == 1 || tl_t == 4 || tl_t == 5);
+                int tr = (tr_t == 1 || tr_t == 4 || tr_t == 5);
+                int bl = (bl_t == 1 || bl_t == 4 || bl_t == 5);
+                int br = (br_t == 1 || br_t == 4 || br_t == 5);
                 int bits = tl | (tr << 1) | (bl << 2) | (br << 3);
 
                 /* In zone mode, also show zone bg for empty cells */
@@ -1229,8 +1434,10 @@ int main(void) {
         }
         else if (key == 'c' || key == 'C') {
             if (population == 0 && generation == 0) {
-                /* Second clear: also reset zones */
+                /* Second clear: also reset zones and emitters/absorbers */
                 zones_clear();
+                n_emitters = 0;
+                n_absorbers = 0;
             }
             grid_clear();
             running = 0;
@@ -1244,10 +1451,20 @@ int main(void) {
                 running = 1;
             }
         }
-        else if (key == '+' || key == '=')
-            speed_ms = speed_ms > 20 ? speed_ms - 20 : 20;
-        else if (key == '-' || key == '_')
-            speed_ms = speed_ms < 1000 ? speed_ms + 20 : 1000;
+        else if (key == '+' || key == '=') {
+            if (emit_mode) {
+                emit_rate = emit_rate > 1 ? emit_rate - 1 : 1;
+            } else {
+                speed_ms = speed_ms > 20 ? speed_ms - 20 : 20;
+            }
+        }
+        else if (key == '-' || key == '_') {
+            if (emit_mode) {
+                emit_rate = emit_rate < 20 ? emit_rate + 1 : 20;
+            } else {
+                speed_ms = speed_ms < 1000 ? speed_ms + 20 : 1000;
+            }
+        }
         else if (key == 'd' || key == 'D')
             draw_mode = !draw_mode;
         else if (key == 'g' || key == 'G')
@@ -1257,7 +1474,9 @@ int main(void) {
         else if (key == 'h' || key == 'H')
             heatmap_mode = !heatmap_mode;
         else if (key == ']') {
-            if (zone_mode) {
+            if (emit_mode) {
+                emit_pattern = (emit_pattern + 1) % N_EMIT_PATTERNS;
+            } else if (zone_mode) {
                 zone_brush = (zone_brush + 1) % N_RULESETS;
             } else {
                 current_ruleset = (current_ruleset + 1) % N_RULESETS;
@@ -1266,7 +1485,9 @@ int main(void) {
             }
         }
         else if (key == '[') {
-            if (zone_mode) {
+            if (emit_mode) {
+                emit_pattern = (emit_pattern - 1 + N_EMIT_PATTERNS) % N_EMIT_PATTERNS;
+            } else if (zone_mode) {
                 zone_brush = (zone_brush - 1 + N_RULESETS) % N_RULESETS;
             } else {
                 current_ruleset = (current_ruleset - 1 + N_RULESETS) % N_RULESETS;
@@ -1278,10 +1499,19 @@ int main(void) {
             show_minimap = !show_minimap;
         else if (key == 'j' || key == 'J') {
             zone_mode = !zone_mode;
+            emit_mode = 0; /* exit emit mode when entering zone mode */
             if (zone_mode) {
-                draw_mode = 1; /* enable drawing when entering zone mode */
+                draw_mode = 1;
             }
-            printf("\033[2J"); fflush(stdout); /* redraw for zone tinting */
+            printf("\033[2J"); fflush(stdout);
+        }
+        else if (key == 'e' || key == 'E') {
+            emit_mode = !emit_mode;
+            zone_mode = 0; /* exit zone mode when entering emit mode */
+            if (emit_mode) {
+                draw_mode = 1;
+            }
+            printf("\033[2J"); fflush(stdout);
         }
         else if (key == 'k' || key == 'K')
             symmetry = (symmetry + 1) % 4;
@@ -1331,8 +1561,13 @@ int main(void) {
             MouseEvent *m = &last_mouse;
             int btn = m->button & 0x43;
 
-            /* Scroll wheel zoom: button 64=scroll-up(zoom in), 65=scroll-down(zoom out) */
-            if (m->type == 1 && btn == 64) {
+            /* Scroll wheel: in emit mode adjusts absorb radius; otherwise zoom */
+            if (emit_mode && m->type == 1 && (btn == 64 || btn == 65)) {
+                if (btn == 64)
+                    absorb_radius = absorb_radius < 10 ? absorb_radius + 1 : 10;
+                else
+                    absorb_radius = absorb_radius > 1 ? absorb_radius - 1 : 1;
+            } else if (m->type == 1 && btn == 64) {
                 if (zoom > 1) {
                     int cx = view_x + view_w / 2;
                     int cy = view_y + view_h / 2;
@@ -1368,7 +1603,22 @@ int main(void) {
                     gy = view_y + (m->y - 3) * 2;
                 }
 
-                if (zone_mode) {
+                if (emit_mode) {
+                    /* Emitter/absorber placement: left=emitter, right=absorber, middle=remove */
+                    if (m->type == 1) {
+                        int mbtn = btn & 0x03;
+                        if (mbtn == 0) {
+                            place_emitter_sym(gx, gy);
+                        } else if (mbtn == 2) {
+                            place_absorber_sym(gx, gy);
+                        } else if (mbtn == 1) {
+                            /* Middle click: remove nearby */
+                            remove_source_sink_near(gx, gy);
+                        }
+                    }
+                    /* No drag support for emit — one click per placement */
+                    if (m->type == 2) mouse_held = 0;
+                } else if (zone_mode) {
                     /* Zone painting mode: left=paint zone, right=reset to zone 0 */
                     if (m->type == 1) {
                         int mbtn = btn & 0x03;
