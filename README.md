@@ -135,7 +135,6 @@ Load an RLE pattern file:
 | `6` | Switch brush species (A ↔ B) |
 | `{` / `}` | Adjust cross-species interaction (-1.0 to +1.0) |
 | `X` | Toggle temperature field |
-| `G` | Genetic rule explorer |
 
 #### Visualization
 
@@ -154,10 +153,12 @@ Load an RLE pattern file:
 | Key | Action |
 |-----|--------|
 | `i` | Entropy heatmap (local Shannon entropy) |
+| `L` | Lyapunov sensitivity (perturbation divergence) |
 | `u` | 2D Fourier spectrum |
 | `f` | Frequency analysis (oscillation period detection) |
 | `F` | Fractal dimension (box-counting) |
 | `C` | Wolfram class detector (I/II/III/IV) |
+| `G` | Genetic rule explorer |
 | `O` | Information flow (transfer entropy vectors) |
 | `A` | Phase-space attractor (Takens embedding) |
 | `9` | Causal light cone |

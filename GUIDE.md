@@ -142,7 +142,7 @@ are structured.
 
 ## Lyapunov Sensitivity
 
-**Toggle: via entropy overlay**
+**Toggle: `L`**
 
 ### What it measures
 

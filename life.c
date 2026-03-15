@@ -30,6 +30,7 @@
  *   T           Cycle signal tracer: off → accumulate → frozen → clear+off
  *   f           Toggle frequency analysis overlay (period detection heatmap)
  *   i           Toggle entropy heatmap overlay (local Shannon entropy)
+ *   L           Toggle Lyapunov sensitivity map (perturbation divergence)
  *   W           Toggle wormhole portal placement (left=entrance, right=exit, middle=remove)
  *                 Paired portals create non-local neighbor coupling
  *   v           Toggle pattern census overlay (counts known structures)
@@ -10181,7 +10182,7 @@ int main(int argc, char **argv) {
             timeline_push(); /* save initial state */
             running = 1;
         }
-        else if (key == 'c' || key == 'C') {
+        else if (key == 'c') {
             if (population == 0 && generation == 0) {
                 /* Second clear: also reset zones, temperature, emitters/absorbers, and portals */
                 zones_clear();
@@ -10246,7 +10247,7 @@ int main(int argc, char **argv) {
         }
         else if (key == 'd')
             draw_mode = !draw_mode;
-        else if (key == 'g' || key == 'G')
+        else if (key == 'g')
             show_graph = !show_graph;
         else if (key == 'y' || key == 'Y')
             dashboard_mode = !dashboard_mode;
@@ -10265,7 +10266,7 @@ int main(int argc, char **argv) {
         }
         else if (key == 'h' || key == 'H')
             heatmap_mode = !heatmap_mode;
-        else if (key == 'f' || key == 'F') {
+        else if (key == 'f') {
             freq_mode = !freq_mode;
             if (freq_mode) {
                 freq_analyze(); /* compute on toggle-on */
