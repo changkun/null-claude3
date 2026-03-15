@@ -43,6 +43,7 @@
  *   Ctrl-P      Dump full timeline buffer as numbered image sequence
  *   Ctrl-S      Save state to numbered .life file
  *   Ctrl-O      Load most recent .life save (or Ctrl-O N for slot N)
+ *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
  *   q / ESC     Quit
@@ -52,7 +53,8 @@
  *               Scroll wheel to zoom in/out
  *
  * Build:  gcc -O2 -o life life.c
- * Run:    ./life
+ * Run:    ./life              (random start)
+ *         ./life pattern.rle  (load RLE file)
  */
 
 #include <stdio.h>
@@ -2259,6 +2261,254 @@ static int read_i32(FILE *f) {
                  ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24));
 }
 
+/* ── RLE pattern import / export ────────────────────────────────────────── */
+
+static int next_export_slot(void) {
+    char path[64];
+    for (int slot = 1; slot <= 999; slot++) {
+        snprintf(path, sizeof(path), "export_%03d.rle", slot);
+        if (access(path, F_OK) != 0) return slot;
+    }
+    return 999;
+}
+
+/* Load an RLE file into the grid, centering the pattern.
+ * Returns 1 on success, 0 on failure. */
+static int load_rle(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    int pat_w = 0, pat_h = 0;
+    int got_header = 0;
+    char line[4096];
+
+    /* Parse header: comments (#), then x = N, y = M[, rule = ...] */
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') continue; /* skip comments */
+
+        /* Look for header line: x = N, y = M ... */
+        if (!got_header) {
+            char *xp = strstr(line, "x");
+            if (!xp) xp = strstr(line, "X");
+            if (xp) {
+                /* Parse x = N */
+                char *eq = strchr(xp, '=');
+                if (eq) pat_w = atoi(eq + 1);
+
+                /* Parse y = M */
+                char *yp = strstr(eq ? eq : xp, "y");
+                if (!yp) yp = strstr(eq ? eq : xp, "Y");
+                if (yp) {
+                    eq = strchr(yp, '=');
+                    if (eq) pat_h = atoi(eq + 1);
+                }
+
+                /* Parse optional rule = B.../S... */
+                char *rp = strstr(line, "rule");
+                if (!rp) rp = strstr(line, "Rule");
+                if (!rp) rp = strstr(line, "RULE");
+                if (rp) {
+                    eq = strchr(rp, '=');
+                    if (eq) {
+                        /* Skip whitespace */
+                        char *rs = eq + 1;
+                        while (*rs == ' ' || *rs == '\t') rs++;
+                        /* Parse B.../S... or b.../s... */
+                        unsigned short b = 0, s = 0;
+                        char *p = rs;
+                        if (*p == 'B' || *p == 'b') {
+                            p++;
+                            while (*p >= '0' && *p <= '8') {
+                                b |= (1 << (*p - '0'));
+                                p++;
+                            }
+                            if (*p == '/') p++;
+                            if (*p == 'S' || *p == 's') {
+                                p++;
+                                while (*p >= '0' && *p <= '8') {
+                                    s |= (1 << (*p - '0'));
+                                    p++;
+                                }
+                            }
+                            birth_mask = b;
+                            survival_mask = s;
+                            current_ruleset = find_matching_ruleset();
+                            if (current_ruleset < 0) current_ruleset = 0;
+                        }
+                    }
+                }
+                got_header = 1;
+            }
+            continue;
+        }
+        break; /* first non-comment, non-header line = start of RLE data */
+    }
+
+    if (!got_header || pat_w <= 0 || pat_h <= 0) {
+        fclose(f);
+        return 0;
+    }
+
+    /* Center pattern on grid */
+    int ox = (W - pat_w) / 2;
+    int oy = (H - pat_h) / 2;
+    if (ox < 0) ox = 0;
+    if (oy < 0) oy = 0;
+
+    /* Clear grid before loading */
+    grid_clear();
+
+    /* Parse RLE data: digits are run counts, b=dead, o=alive, $=end row, !=end */
+    int cx = 0, cy = 0;
+    int run = 0;
+    int done = 0;
+
+    /* We already have 'line' with the first data line; process it then read more */
+    for (;;) {
+        char *p = line;
+        while (*p && !done) {
+            if (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') {
+                p++;
+                continue;
+            }
+            if (*p >= '0' && *p <= '9') {
+                run = run * 10 + (*p - '0');
+                p++;
+                continue;
+            }
+            if (run == 0) run = 1;
+
+            if (*p == 'b') {
+                cx += run;
+            } else if (*p == 'o') {
+                for (int i = 0; i < run; i++) {
+                    int gx = ox + cx;
+                    int gy = oy + cy;
+                    if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
+                        grid[gy][gx] = 1;
+                        population++;
+                    }
+                    cx++;
+                }
+            } else if (*p == '$') {
+                cy += run;
+                cx = 0;
+            } else if (*p == '!') {
+                done = 1;
+            }
+            run = 0;
+            p++;
+        }
+        if (done) break;
+        if (!fgets(line, sizeof(line), f)) break;
+    }
+
+    fclose(f);
+    generation = 0;
+    return 1;
+}
+
+/* Export current grid as RLE file. */
+static void export_rle(void) {
+    /* Find bounding box of live cells */
+    int x0 = W, y0 = H, x1 = -1, y1 = -1;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x]) {
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+
+    if (x1 < 0) {
+        flash_set("Nothing to export (grid empty)");
+        return;
+    }
+
+    int pat_w = x1 - x0 + 1;
+    int pat_h = y1 - y0 + 1;
+
+    int slot = next_export_slot();
+    char path[64];
+    snprintf(path, sizeof(path), "export_%03d.rle", slot);
+
+    FILE *f = fopen(path, "w");
+    if (!f) { flash_set("Export failed!"); return; }
+
+    /* Write header comment */
+    fprintf(f, "#C Exported from Life Explorer, generation %d\n", generation);
+
+    /* Write header line with rule */
+    char rule[32];
+    rule_to_string(rule, sizeof(rule));
+    fprintf(f, "x = %d, y = %d, rule = %s\n", pat_w, pat_h, rule);
+
+    /* Encode RLE data */
+    int col = 0; /* column counter for line wrapping at 70 chars */
+    for (int y = y0; y <= y1; y++) {
+        int x = x0;
+        while (x <= x1) {
+            /* Count run of same state */
+            int alive = grid[y][x] ? 1 : 0;
+            int run = 0;
+            while (x + run <= x1 && (grid[y][x + run] ? 1 : 0) == alive)
+                run++;
+
+            /* Skip trailing dead cells on this row */
+            if (!alive && x + run > x1) break;
+
+            /* Write run */
+            char tag = alive ? 'o' : 'b';
+            char tmp[16];
+            int n;
+            if (run > 1)
+                n = snprintf(tmp, sizeof(tmp), "%d%c", run, tag);
+            else
+                n = snprintf(tmp, sizeof(tmp), "%c", tag);
+
+            /* Line wrap at ~70 chars */
+            if (col + n > 70) {
+                fputc('\n', f);
+                col = 0;
+            }
+            fputs(tmp, f);
+            col += n;
+
+            x += run;
+        }
+        /* End of row: $ (or ! for last row) */
+        if (y < y1) {
+            /* Count consecutive blank rows */
+            int blank_rows = 0;
+            while (y + 1 + blank_rows <= y1) {
+                int all_dead = 1;
+                for (int bx = x0; bx <= x1; bx++)
+                    if (grid[y + 1 + blank_rows][bx]) { all_dead = 0; break; }
+                if (!all_dead) break;
+                blank_rows++;
+            }
+            char tmp[16];
+            int total = 1 + blank_rows;
+            int n;
+            if (total > 1)
+                n = snprintf(tmp, sizeof(tmp), "%d$", total);
+            else
+                n = snprintf(tmp, sizeof(tmp), "$");
+            if (col + n > 70) { fputc('\n', f); col = 0; }
+            fputs(tmp, f);
+            col += n;
+            y += blank_rows;
+        }
+    }
+    fprintf(f, "!\n");
+    fclose(f);
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Exported %s (%dx%d)", path, pat_w, pat_h);
+    flash_set(msg);
+}
+
 static void save_state(void) {
     int slot = next_save_slot();
     char path[64];
@@ -3287,7 +3537,7 @@ static void render(int running, int speed_ms, int draw_mode) {
                      "[1-5]pre [d]draw [k]sym [g]graph [w]topo [h]heat [T]trace [f]freq "
                      "[/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
-                     "C-s:save C-o:load [q]quit\033[0m\033[K\n");
+                     "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
     if (usable_rows < 5) usable_rows = 5;
@@ -3817,7 +4067,7 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     srand(time(NULL));
     build_pulsar();
     stamp_init();
@@ -3829,7 +4079,15 @@ int main(void) {
     viewport_update();
     viewport_center();
 
-    grid_randomize(0.25);
+    if (argc > 1 && argv[1][0] != '-') {
+        /* Load RLE file from command line */
+        if (!load_rle(argv[1])) {
+            fprintf(stderr, "Failed to load RLE file: %s\n", argv[1]);
+            return 1;
+        }
+    } else {
+        grid_randomize(0.25);
+    }
     hist_push(population);
     timeline_push(); /* save initial state */
 
@@ -3952,6 +4210,8 @@ int main(void) {
             load_state(0); /* load most recent */
             printf("\033[2J"); fflush(stdout);
         }
+        else if (key == 5) /* Ctrl-E: export RLE */
+            export_rle();
         else if (key == 'r' || key == 'R') {
             grid_randomize(0.25);
             timeline_push(); /* save initial state */
