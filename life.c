@@ -57,6 +57,7 @@
  *   9           Toggle causal light cone (click cell to trace backward/forward cones)
  *                 +/- adjust forward cone depth, click to retarget
  *   !           Toggle prediction surprise field (per-cell surprisal heatmap)
+ *   @           Toggle mutual information network (inter-region coupling map)
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -309,6 +310,35 @@ static int surp_hist_len = 0;           /* filled entries */
 /* Hash table for transition frequency counting */
 static int surp_trans_count[SURP_HASH_SIZE];  /* count of (config → alive) */
 static int surp_trans_total[SURP_HASH_SIZE];  /* total count of config */
+
+/* ── Mutual Information Network ────────────────────────────────────────────── */
+/* Inter-region coupling map: partition grid into coarse blocks, compute MI
+   between block population time series over the timeline history, and render
+   the strongest couplings as colored lines — revealing long-range
+   synchronization, oscillator entrainment, and glider communication channels. */
+#define MI_BLK_W  20   /* block width in cells */
+#define MI_BLK_H  20   /* block height in cells */
+#define MI_GW     (MAX_W / MI_BLK_W)  /* 20 block columns */
+#define MI_GH     (MAX_H / MI_BLK_H)  /* 10 block rows */
+#define MI_NBLK   (MI_GW * MI_GH)     /* 200 total blocks */
+#define MI_BINS   8     /* discretization bins for population time series */
+#define MI_TOP_N  40    /* max number of top couplings to display */
+
+typedef struct {
+    int a, b;      /* block indices */
+    float mi;      /* mutual information (bits) */
+} MICoupling;
+
+static int   mi_mode = 0;            /* 0=off, 1=on */
+static int   mi_stale = 1;           /* 1=needs recomputation */
+static float mi_overlay[MAX_H][MAX_W]; /* per-cell MI value for line drawing */
+static MICoupling mi_top[MI_TOP_N];  /* top-N strongest couplings */
+static int   mi_n_top = 0;           /* number of stored couplings */
+static float mi_mean_val = 0.0f;     /* mean MI across all pairs */
+static float mi_max_val = 0.0f;      /* max MI value */
+static float mi_net_density = 0.0f;  /* fraction of pairs above threshold */
+static float mi_clustering = 0.0f;   /* clustering coefficient */
+static int   mi_n_frames_used = 0;   /* frames used in last computation */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1190,6 +1220,7 @@ static void grid_step(void) {
     flow_stale = 1;
     attractor_stale = 1;
     surp_stale = 1;
+    mi_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -3838,6 +3869,230 @@ static RGB surp_to_rgb(float s) {
     }
 }
 
+/* ── Mutual Information Network computation ──────────────────────────────── */
+
+/* Draw a Bresenham line on mi_overlay, keeping max MI at each cell */
+static void mi_draw_line(int x0, int y0, int x1, int y1, float val) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < W && y0 >= 0 && y0 < H) {
+            if (val > mi_overlay[y0][x0])
+                mi_overlay[y0][x0] = val;
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* MI color gradient: dark blue → cyan → green → yellow → magenta → white */
+static RGB mi_to_rgb(float val) {
+    float t = mi_max_val > 0.001f ? val / mi_max_val : 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    if (t < 0.2f) {
+        float s = t / 0.2f;
+        return (RGB){ (unsigned char)(15 + 15 * s),
+                      (unsigned char)(30 + 170 * s),
+                      (unsigned char)(120 + 135 * s) };
+    } else if (t < 0.4f) {
+        float s = (t - 0.2f) / 0.2f;
+        return (RGB){ (unsigned char)(30 + 30 * s),
+                      (unsigned char)(200 + 55 * s),
+                      (unsigned char)(255 - 120 * s) };
+    } else if (t < 0.6f) {
+        float s = (t - 0.4f) / 0.2f;
+        return (RGB){ (unsigned char)(60 + 195 * s),
+                      (unsigned char)(255 - 30 * s),
+                      (unsigned char)(135 - 115 * s) };
+    } else if (t < 0.8f) {
+        float s = (t - 0.6f) / 0.2f;
+        return (RGB){ (unsigned char)(255),
+                      (unsigned char)(225 - 125 * s),
+                      (unsigned char)(20 + 130 * s) };
+    } else {
+        float s = (t - 0.8f) / 0.2f;
+        return (RGB){ (unsigned char)(255),
+                      (unsigned char)(100 + 155 * s),
+                      (unsigned char)(150 + 105 * s) };
+    }
+}
+
+static void mi_compute(void) {
+    int n = tl_len;
+    if (n < 16) {
+        memset(mi_overlay, 0, sizeof(mi_overlay));
+        mi_n_top = 0;
+        mi_mean_val = 0; mi_max_val = 0;
+        mi_net_density = 0; mi_clustering = 0;
+        mi_n_frames_used = n;
+        mi_stale = 0;
+        return;
+    }
+
+    int depth = n < 256 ? n : 256;
+    mi_n_frames_used = depth;
+
+    /* Step 1: Extract block populations from timeline */
+    static int bpop[MI_NBLK][256]; /* 200 × 256 × 4 = 200KB */
+    memset(bpop, 0, sizeof(bpop));
+
+    for (int fi = 0; fi < depth; fi++) {
+        TimelineFrame *f = timeline_get(fi);
+        if (!f) continue;
+        for (int y = 0; y < H; y++) {
+            int by = y / MI_BLK_H;
+            for (int x = 0; x < W; x++) {
+                if (f->grid[y][x] > 0) {
+                    int bx = x / MI_BLK_W;
+                    bpop[by * MI_GW + bx][fi]++;
+                }
+            }
+        }
+    }
+
+    /* Step 2: Compute min/max per block for binning */
+    int bmin[MI_NBLK], bmax[MI_NBLK];
+    for (int bi = 0; bi < MI_NBLK; bi++) {
+        bmin[bi] = bpop[bi][0]; bmax[bi] = bpop[bi][0];
+        for (int fi = 1; fi < depth; fi++) {
+            if (bpop[bi][fi] < bmin[bi]) bmin[bi] = bpop[bi][fi];
+            if (bpop[bi][fi] > bmax[bi]) bmax[bi] = bpop[bi][fi];
+        }
+    }
+
+    /* Step 3: Quantize to bins */
+    static unsigned char bbin[MI_NBLK][256]; /* 200 × 256 = 50KB */
+    for (int bi = 0; bi < MI_NBLK; bi++) {
+        int range = bmax[bi] - bmin[bi];
+        if (range == 0) {
+            memset(bbin[bi], 0, depth);
+        } else {
+            for (int fi = 0; fi < depth; fi++) {
+                int b = (bpop[bi][fi] - bmin[bi]) * (MI_BINS - 1) / range;
+                if (b >= MI_BINS) b = MI_BINS - 1;
+                bbin[bi][fi] = (unsigned char)b;
+            }
+        }
+    }
+
+    /* Step 4: Precompute per-block marginal entropy and marginal histogram */
+    int marg_hist[MI_NBLK][MI_BINS];
+    memset(marg_hist, 0, sizeof(marg_hist));
+    for (int bi = 0; bi < MI_NBLK; bi++)
+        for (int fi = 0; fi < depth; fi++)
+            marg_hist[bi][(int)bbin[bi][fi]]++;
+
+    /* Step 5: Compute MI for all pairs, keep top-N */
+    mi_n_top = 0;
+    double sum_mi = 0.0;
+    int n_pairs = 0;
+    int n_above = 0;
+    float mi_threshold = 0.1f;
+
+    for (int ai = 0; ai < MI_NBLK; ai++) {
+        if (bmax[ai] == bmin[ai]) continue; /* skip constant blocks */
+        for (int bi = ai + 1; bi < MI_NBLK; bi++) {
+            if (bmax[bi] == bmin[bi]) continue;
+            n_pairs++;
+
+            /* Build joint histogram */
+            int joint[MI_BINS][MI_BINS];
+            memset(joint, 0, sizeof(joint));
+            for (int fi = 0; fi < depth; fi++)
+                joint[bbin[ai][fi]][bbin[bi][fi]]++;
+
+            /* MI = Σ p(x,y) log2(p(x,y) / (p(x)p(y))) */
+            double mi = 0.0;
+            double inv_n = 1.0 / (double)depth;
+            for (int i = 0; i < MI_BINS; i++) {
+                if (marg_hist[ai][i] == 0) continue;
+                double pa = (double)marg_hist[ai][i] * inv_n;
+                for (int j = 0; j < MI_BINS; j++) {
+                    if (joint[i][j] == 0 || marg_hist[bi][j] == 0) continue;
+                    double pab = (double)joint[i][j] * inv_n;
+                    double pb = (double)marg_hist[bi][j] * inv_n;
+                    mi += pab * log(pab / (pa * pb));
+                }
+            }
+            mi *= 1.4426950408889634; /* convert to bits (1/ln2) */
+            if (mi < 0.0) mi = 0.0;
+
+            float mif = (float)mi;
+            sum_mi += mi;
+            if (mif > mi_threshold) n_above++;
+
+            /* Insert into top-N sorted list (descending by MI) */
+            if (mi_n_top < MI_TOP_N || mif > mi_top[mi_n_top - 1].mi) {
+                int pos = mi_n_top < MI_TOP_N ? mi_n_top : MI_TOP_N - 1;
+                while (pos > 0 && mi_top[pos - 1].mi < mif) {
+                    if (pos < MI_TOP_N)
+                        mi_top[pos] = mi_top[pos - 1];
+                    pos--;
+                }
+                mi_top[pos].a = ai;
+                mi_top[pos].b = bi;
+                mi_top[pos].mi = mif;
+                if (mi_n_top < MI_TOP_N) mi_n_top++;
+            }
+        }
+    }
+
+    mi_mean_val = n_pairs > 0 ? (float)(sum_mi / n_pairs) : 0.0f;
+    mi_max_val = mi_n_top > 0 ? mi_top[0].mi : 0.0f;
+    mi_net_density = n_pairs > 0 ? (float)n_above / n_pairs : 0.0f;
+
+    /* Step 6: Compute clustering coefficient */
+    static unsigned char adj[MI_NBLK][MI_NBLK]; /* 200×200 = 40KB */
+    memset(adj, 0, sizeof(adj));
+    int degree[MI_NBLK];
+    memset(degree, 0, sizeof(degree));
+
+    for (int i = 0; i < mi_n_top; i++) {
+        adj[mi_top[i].a][mi_top[i].b] = 1;
+        adj[mi_top[i].b][mi_top[i].a] = 1;
+        degree[mi_top[i].a]++;
+        degree[mi_top[i].b]++;
+    }
+
+    double cc_sum = 0.0;
+    int cc_count = 0;
+    for (int ni = 0; ni < MI_NBLK; ni++) {
+        if (degree[ni] < 2) continue;
+        int nbrs[MI_TOP_N * 2];
+        int nn = 0;
+        for (int nj = 0; nj < MI_NBLK && nn < MI_TOP_N * 2; nj++)
+            if (adj[ni][nj]) nbrs[nn++] = nj;
+        int triangles = 0;
+        for (int a = 0; a < nn; a++)
+            for (int b = a + 1; b < nn; b++)
+                if (adj[nbrs[a]][nbrs[b]]) triangles++;
+        int possible = nn * (nn - 1) / 2;
+        if (possible > 0) {
+            cc_sum += (double)triangles / possible;
+            cc_count++;
+        }
+    }
+    mi_clustering = cc_count > 0 ? (float)(cc_sum / cc_count) : 0.0f;
+
+    /* Step 7: Draw coupling lines on overlay grid */
+    memset(mi_overlay, 0, sizeof(mi_overlay));
+
+    for (int i = 0; i < mi_n_top; i++) {
+        int ai = mi_top[i].a;
+        int bi = mi_top[i].b;
+        int ax = (ai % MI_GW) * MI_BLK_W + MI_BLK_W / 2;
+        int ay = (ai / MI_GW) * MI_BLK_H + MI_BLK_H / 2;
+        int bx = (bi % MI_GW) * MI_BLK_W + MI_BLK_W / 2;
+        int by = (bi / MI_GW) * MI_BLK_H + MI_BLK_H / 2;
+        mi_draw_line(ax, ay, bx, by, mi_top[i].mi);
+    }
+
+    mi_stale = 0;
+}
+
 /* Map flow magnitude + direction to RGB color and Unicode arrow glyph */
 static RGB flow_to_rgb(float mag, float vx, float vy) {
     /* Normalize magnitude for color */
@@ -5371,6 +5626,41 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Mutual information network overlay: inter-region coupling lines */
+    if (mi_mode) {
+        float mv = mi_overlay[y][x];
+        if (mv > 0.001f) {
+            *out = mi_to_rgb(mv);
+            /* Brighten where live cells coincide with lines */
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return 1; /* line pixel */
+        }
+        /* Block center markers */
+        if ((x % MI_BLK_W == MI_BLK_W / 2) && (y % MI_BLK_H == MI_BLK_H / 2)) {
+            out->r = 140; out->g = 140; out->b = 180;
+            return 1;
+        }
+        /* Block grid lines (very faint) */
+        if ((x % MI_BLK_W == 0) || (y % MI_BLK_H == 0)) {
+            if (grid[y][x]) {
+                out->r = 40; out->g = 55; out->b = 65;
+                return 1;
+            }
+            out->r = 10; out->g = 13; out->b = 18;
+            return 18; /* MI grid ghost */
+        }
+        /* Normal cells dimmed */
+        if (grid[y][x]) {
+            out->r = 25; out->g = 45; out->b = 25;
+            return 1;
+        }
+        return 0;
+    }
+
     /* Prediction surprise field overlay: surprisal heatmap */
     if (surp_mode) {
         float s = surp_grid[y][x];
@@ -5581,6 +5871,12 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(surp_str, sizeof(surp_str),
                  " \033[38;2;255;200;60m\xe2\x9a\xa1SURP:%.3f\033[0m", surp_global);
 
+    /* MI network indicator */
+    char mi_str[96] = "";
+    if (mi_mode)
+        snprintf(mi_str, sizeof(mi_str),
+                 " \033[38;2;100;200;255m\xe2\x97\x88MI:%.3f\033[0m", mi_max_val);
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -5701,9 +5997,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -5728,7 +6024,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
-                     "[X]temp [C]class [O]flow [9]cone [!]surp [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
@@ -5789,6 +6085,9 @@ static void render(int running, int speed_ms, int draw_mode) {
                     } else {
                         p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
                     }
+                } else if (t == 18) {
+                    /* MI network grid lines: dim colored background */
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
                 } else {
                     *p++ = ' '; *p++ = ' ';
                 }
@@ -7449,6 +7748,104 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", srst);
     }
 
+    /* ── Mutual Information Network overlay panel ────────────────────────────── */
+    if (mi_mode) {
+        int mi_w = 44;
+        int mi_col = term_cols - mi_w - 2;
+        /* Stack below other active panels */
+        int mi_row = 3;
+        if (entropy_mode)   mi_row += 8;
+        if (temp_mode)      mi_row += 9;
+        if (lyapunov_mode)  mi_row += 8;
+        if (fourier_mode)   mi_row += 18;
+        if (fractal_mode)   mi_row += 11;
+        if (wolfram_mode)   mi_row += 14;
+        if (flow_mode)      mi_row += 9;
+        if (attractor_mode) mi_row += 8;
+        if (cone_mode >= 1) mi_row += 8;
+        if (surp_mode)      mi_row += 8;
+        if (mi_col < 1) mi_col = 1;
+
+        const char *mbdr = "\033[38;2;100;200;255;48;2;8;14;22m";
+        const char *mbg  = "\033[48;2;8;14;22m";
+        const char *mrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 MI Network \xe2\x97\x88 ",
+                     mi_row, mi_col, mbdr);
+        for (int i = 17; i < mi_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", mrst);
+
+        /* Row 1: Max MI */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mi_row + 1, mi_col, mbdr, mbg);
+        p += sprintf(p, " \033[38;2;180;220;255mMax MI:  \033[1;38;2;100;200;255m%.4f bits",
+                     mi_max_val);
+        { int used = 26; for (int i = used; i < mi_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mbdr, mrst);
+
+        /* Row 2: Mean MI */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mi_row + 2, mi_col, mbdr, mbg);
+        p += sprintf(p, " \033[38;2;180;220;255mMean MI: \033[38;2;140;190;240m%.4f bits",
+                     mi_mean_val);
+        { int used = 26; for (int i = used; i < mi_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mbdr, mrst);
+
+        /* Row 3: Network density */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mi_row + 3, mi_col, mbdr, mbg);
+        p += sprintf(p, " \033[38;2;180;220;255mDensity: \033[38;2;140;255;180m%.3f",
+                     mi_net_density);
+        { int used = 18; for (int i = used; i < mi_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mbdr, mrst);
+
+        /* Row 4: Clustering coefficient */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mi_row + 4, mi_col, mbdr, mbg);
+        p += sprintf(p, " \033[38;2;180;220;255mCluster: \033[38;2;255;200;100m%.3f",
+                     mi_clustering);
+        { int used = 18; for (int i = used; i < mi_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mbdr, mrst);
+
+        /* Rows 5-9: Top 5 couplings */
+        int show_n = mi_n_top < 5 ? mi_n_top : 5;
+        for (int ci = 0; ci < 5; ci++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         mi_row + 5 + ci, mi_col, mbdr, mbg);
+            if (ci < show_n) {
+                int ai = mi_top[ci].a;
+                int bi = mi_top[ci].b;
+                int ax = ai % MI_GW, ay = ai / MI_GW;
+                int bx = bi % MI_GW, by = bi / MI_GW;
+                /* Color coupling by rank: brightest for strongest */
+                int bright = 255 - ci * 35;
+                p += sprintf(p, " \033[38;2;%d;%d;%dm(%d,%d)\xe2\x86\x94(%d,%d) %.3f",
+                             bright, bright - 30 > 0 ? bright - 30 : 0, bright/2,
+                             ax, ay, bx, by, mi_top[ci].mi);
+                { int used = 24; for (int i = used; i < mi_w - 1; i++) *p++ = ' '; }
+            } else {
+                for (int i = 0; i < mi_w - 1; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", mbdr, mrst);
+        }
+
+        /* Row 10: History depth + toggle key */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mi_row + 10, mi_col, mbdr, mbg);
+        p += sprintf(p, " \033[38;2;100;100;80mFrames: %d  Blocks: %dx%d  [@]toggle",
+                     mi_n_frames_used, MI_GW, MI_GH);
+        { int used = 39; for (int i = used; i < mi_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mbdr, mrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", mi_row + 11, mi_col, mbdr);
+        for (int i = 0; i < mi_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", mrst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -7957,6 +8354,12 @@ int main(int argc, char **argv) {
                 surp_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '@') {
+            mi_mode = !mi_mode;
+            if (mi_mode) {
+                mi_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -8398,6 +8801,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh surprise field every 4 generations */
         if (surp_mode && surp_stale && (generation % 4 == 0 || !running)) {
             surp_compute();
+        }
+
+        /* Auto-refresh MI network every 8 generations */
+        if (mi_mode && mi_stale && (generation % 8 == 0 || !running)) {
+            mi_compute();
         }
 
         render(running, speed_ms, draw_mode);
