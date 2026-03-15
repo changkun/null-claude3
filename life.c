@@ -27,6 +27,8 @@
  *   t           Toggle timeline bar display
  *   T           Cycle signal tracer: off → accumulate → frozen → clear+off
  *   f           Toggle frequency analysis overlay (period detection heatmap)
+ *   W           Toggle wormhole portal placement (left=entrance, right=exit, middle=remove)
+ *                 Paired portals create non-local neighbor coupling
  *   Ctrl-S      Save state to numbered .life file
  *   Ctrl-O      Load most recent .life save (or Ctrl-O N for slot N)
  *   Arrow keys  Pan viewport across the full 400×200 grid
@@ -237,6 +239,84 @@ static void place_absorber_sym(int gx, int gy) {
 
 static const char *emit_pattern_names[] = { "dot", "cross", "rand3", "glider" };
 #define N_EMIT_PATTERNS 4
+
+/* Forward declaration for wrap_coord */
+static inline int wrap_coord(int v, int max);
+
+/* ── Wormhole Portals (non-local spatial coupling) ─────────────────────────── */
+
+#define MAX_PORTALS 8   /* max portal pairs */
+
+typedef struct {
+    int ax, ay;     /* entrance position */
+    int bx, by;     /* exit position */
+    int radius;     /* coupling radius (2..5) */
+    int active;     /* 1=both endpoints placed, 0=incomplete */
+} Portal;
+
+static Portal portals[MAX_PORTALS];
+static int n_portals = 0;
+static int portal_mode = 0;       /* 0=off, 1=portal placement mode */
+static int portal_placing = 0;    /* 0=ready, 1=placing exit (entrance set in portal_wip) */
+static int portal_wip_x, portal_wip_y; /* work-in-progress entrance coords */
+static int portal_radius = 3;     /* radius for new portals */
+
+/* Remove portal near (x,y) */
+static void remove_portal_near(int x, int y) {
+    for (int i = 0; i < n_portals; i++) {
+        int dxa = x - portals[i].ax, dya = y - portals[i].ay;
+        int dxb = x - portals[i].bx, dyb = y - portals[i].by;
+        if (dxa*dxa + dya*dya <= 25 || dxb*dxb + dyb*dyb <= 25) {
+            portals[i] = portals[--n_portals];
+            i--;
+        }
+    }
+}
+
+/* Get the count of extra "portal neighbors" for cell (x,y).
+ * Cells near a portal entrance also see cells near the paired exit, and vice versa. */
+static int portal_neighbor_count(int x, int y) {
+    int extra = 0;
+    for (int i = 0; i < n_portals; i++) {
+        if (!portals[i].active) continue;
+        int r = portals[i].radius;
+        int r2 = r * r;
+        /* Check if near entrance → sample around exit */
+        int dxa = x - portals[i].ax, dya = y - portals[i].ay;
+        if (dxa*dxa + dya*dya <= r2) {
+            /* Map relative position: offset from entrance center → same offset at exit */
+            int ox = portals[i].bx + dxa;
+            int oy = portals[i].by + dya;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = ox + dx, ny = oy + dy;
+                    if (wrap_mode) {
+                        nx = wrap_coord(nx, W);
+                        ny = wrap_coord(ny, H);
+                    } else if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                    extra += (grid[ny][nx] > 0);
+                }
+        }
+        /* Check if near exit → sample around entrance */
+        int dxb = x - portals[i].bx, dyb = y - portals[i].by;
+        if (dxb*dxb + dyb*dyb <= r2) {
+            int ox = portals[i].ax + dxb;
+            int oy = portals[i].ay + dyb;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = ox + dx, ny = oy + dy;
+                    if (wrap_mode) {
+                        nx = wrap_coord(nx, W);
+                        ny = wrap_coord(ny, H);
+                    } else if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                    extra += (grid[ny][nx] > 0);
+                }
+        }
+    }
+    return extra;
+}
 
 /* ── Timeline (time-travel history) ────────────────────────────────────────── */
 
@@ -491,6 +571,10 @@ static void grid_step(void) {
                             n += (grid[ny][nx] > 0);
                     }
                 }
+            /* Add portal neighbor contributions (non-local coupling) */
+            if (n_portals > 0)
+                n += portal_neighbor_count(x, y);
+
             int alive = grid[y][x] > 0;
             /* Use per-cell zone rules if zones are active, else global */
             unsigned short b_mask = birth_mask;
@@ -1091,6 +1175,14 @@ static void save_state(void) {
         write_i32(f, absorbers[i].x); write_i32(f, absorbers[i].y);
         write_i32(f, absorbers[i].radius);
     }
+    /* Portals (appended for backward compat — old files just won't have them) */
+    fputc((unsigned char)n_portals, f);
+    for (int i = 0; i < n_portals; i++) {
+        write_i32(f, portals[i].ax); write_i32(f, portals[i].ay);
+        write_i32(f, portals[i].bx); write_i32(f, portals[i].by);
+        write_i32(f, portals[i].radius);
+        fputc(portals[i].active, f);
+    }
 
     fclose(f);
     char msg[80];
@@ -1140,6 +1232,21 @@ static void load_state(int slot) {
         absorbers[i].x = read_i32(f); absorbers[i].y = read_i32(f);
         absorbers[i].radius = read_i32(f);
     }
+
+    /* Load portals if present (backward compat: may be at EOF) */
+    int np = fgetc(f);
+    if (np != EOF && np > 0 && np <= MAX_PORTALS) {
+        n_portals = np;
+        for (int i = 0; i < n_portals; i++) {
+            portals[i].ax = read_i32(f); portals[i].ay = read_i32(f);
+            portals[i].bx = read_i32(f); portals[i].by = read_i32(f);
+            portals[i].radius = read_i32(f);
+            portals[i].active = fgetc(f);
+        }
+    } else {
+        n_portals = 0;
+    }
+    portal_placing = 0;
 
     fclose(f);
 
@@ -1300,6 +1407,9 @@ static void render_sparkline(char **pp, int width) {
     *pp = p;
 }
 
+/* Forward declaration */
+static int portal_marker(int x, int y, RGB *out);
+
 /* ── Minimap overlay ───────────────────────────────────────────────────────── */
 
 /* Quarter-block chars for minimap (same encoding as zoom 4x) */
@@ -1388,9 +1498,16 @@ static void render_minimap(char **pp) {
                 if (gy1 > MAX_H) gy1 = MAX_H;
 
                 for (int gy = gy0; gy < gy1 && !alive[q]; gy++)
-                    for (int gx = gx0; gx < gx1 && !alive[q]; gx++)
+                    for (int gx = gx0; gx < gx1 && !alive[q]; gx++) {
                         if (grid[gy][gx] || (tracer_mode > 0 && tracer[gy][gx] > 10))
                             alive[q] = 1;
+                        /* Show portal regions on minimap */
+                        if (!alive[q] && n_portals > 0) {
+                            RGB dummy;
+                            if (portal_marker(gx, gy, &dummy))
+                                alive[q] = 1;
+                        }
+                    }
             }
 
             int bits = 0;
@@ -1646,6 +1763,70 @@ static void render_rule_editor(char **pp) {
 /* Larger buffer for true-color escape sequences */
 static char render_buf[MAX_H * MAX_W * 40 + 16384];
 
+/* Check if (x,y) is on a portal ring. Returns 8=entrance, 9=exit, 0=no */
+static int portal_marker(int x, int y, RGB *out) {
+    for (int i = 0; i < n_portals; i++) {
+        int r = portals[i].radius;
+        int r2_outer = r * r;
+        int r2_inner = (r - 1) * (r - 1);
+        /* Animated swirl: phase offset based on generation + angle */
+        int phase = (generation / 2 + i * 37) % 24;
+
+        /* Entrance ring (cyan/teal) */
+        int dxa = x - portals[i].ax, dya = y - portals[i].ay;
+        int d2a = dxa*dxa + dya*dya;
+        if (d2a >= r2_inner && d2a <= r2_outer) {
+            /* Swirl effect: brightness varies by angle */
+            int angle = (dxa + dya + phase) & 7;
+            int bright = 120 + angle * 18;
+            if (bright > 255) bright = 255;
+            *out = (RGB){ 0, (unsigned char)(bright * 3/4), (unsigned char)bright };
+            return portals[i].active ? 8 : 10; /* 10 = incomplete entrance */
+        }
+        /* Center dot for entrance */
+        if (d2a <= 1) {
+            *out = (RGB){ 40, 220, 255 };
+            return 8;
+        }
+
+        if (!portals[i].active) continue;
+
+        /* Exit ring (magenta/pink) */
+        int dxb = x - portals[i].bx, dyb = y - portals[i].by;
+        int d2b = dxb*dxb + dyb*dyb;
+        if (d2b >= r2_inner && d2b <= r2_outer) {
+            int angle = (dxb + dyb + phase) & 7;
+            int bright = 120 + angle * 18;
+            if (bright > 255) bright = 255;
+            *out = (RGB){ (unsigned char)bright, 0, (unsigned char)(bright * 3/4) };
+            return 9;
+        }
+        /* Center dot for exit */
+        if (d2b <= 1) {
+            *out = (RGB){ 255, 40, 200 };
+            return 9;
+        }
+    }
+    /* Also show WIP entrance if placing */
+    if (portal_mode && portal_placing) {
+        int dx = x - portal_wip_x, dy = y - portal_wip_y;
+        int d2 = dx*dx + dy*dy;
+        int r = portal_radius;
+        if (d2 >= (r-1)*(r-1) && d2 <= r*r) {
+            int angle = (dx + dy + (generation/2)) & 7;
+            int bright = 100 + angle * 20;
+            if (bright > 255) bright = 255;
+            *out = (RGB){ 0, (unsigned char)(bright * 3/4), (unsigned char)bright };
+            return 10;
+        }
+        if (d2 <= 1) {
+            *out = (RGB){ 40, 220, 255 };
+            return 10;
+        }
+    }
+    return 0;
+}
+
 /* Check if (x,y) is near an emitter or absorber. Returns: 4=emitter, 5=absorber, 0=neither */
 static int source_sink_marker(int x, int y, RGB *out) {
     /* Emitters: bright pulsing cyan/white marker */
@@ -1680,6 +1861,10 @@ static int source_sink_marker(int x, int y, RGB *out) {
 /* Get cell color for rendering (returns 1 if alive, fills rgb; 2 if ghost; 3 if zone bg; 4=emitter; 5=absorber) */
 static int cell_color(int x, int y, RGB *out) {
     if (x < 0 || x >= W || y < 0 || y >= H) return 0;
+
+    /* Portal markers */
+    int pm = portal_marker(x, y, out);
+    if (pm) return pm;
 
     /* Source/sink markers take priority for center pixels */
     int ss = source_sink_marker(x, y, out);
@@ -1811,6 +1996,24 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[90m\xe2\x97\x89" "%dE/%dA\033[0m", n_emitters, n_absorbers);
     }
 
+    /* Portal mode indicator */
+    char portal_str[128] = "";
+    if (portal_mode) {
+        if (portal_placing)
+            snprintf(portal_str, sizeof(portal_str),
+                     " \033[38;2;40;220;255m\xE2\x97\x8EPORTAL:exit? r%d\033[0m"
+                     " \033[90m(%d/%d)\033[0m",
+                     portal_radius, n_portals, MAX_PORTALS);
+        else
+            snprintf(portal_str, sizeof(portal_str),
+                     " \033[38;2;40;220;255m\xE2\x97\x8EPORTAL r%d\033[0m"
+                     " \033[90m(%d/%d)\033[0m",
+                     portal_radius, n_portals, MAX_PORTALS);
+    } else if (n_portals > 0) {
+        snprintf(portal_str, sizeof(portal_str),
+                 " \033[90m\xE2\x97\x8E%dP\033[0m", n_portals);
+    }
+
     /* Zone mode indicator */
     char zone_str[80] = "";
     if (zone_mode) {
@@ -1838,10 +2041,10 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
                  state, wrap_str, draw_str, heat_str, tracer_str, freq_str, sym_str, zoom_str, map_str, zone_str,
-                 emit_str, rule_display, generation, population, speed_ms);
+                 portal_str, emit_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
     if (flash_active()) {
@@ -1865,7 +2068,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace [f]freq "
-                     "[/]rule [m]mut [b]edit [j]zone [e]emit [z/x]zoom [n]map [<>]time [t]tbar "
+                     "[/]rule [m]mut [b]edit [j]zone [e]emit [W]worm [z/x]zoom [n]map [<>]time [t]tbar "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
@@ -1897,6 +2100,15 @@ static void render(int running, int speed_ms, int draw_mode) {
                 } else if (t == 7) {
                     /* Freq analysis ghost: dim colored background */
                     p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
+                } else if (t == 8) {
+                    /* Portal entrance: swirling cyan ring */
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8E \033[0m", c.r/3, c.g/3, c.b/3);
+                } else if (t == 9) {
+                    /* Portal exit: swirling magenta ring */
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8E \033[0m", c.r/3, c.g/3, c.b/3);
+                } else if (t == 10) {
+                    /* WIP portal entrance (placing) */
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8C \033[0m", c.r/3, c.g/3, c.b/3);
                 } else {
                     *p++ = ' '; *p++ = ' ';
                 }
@@ -1916,9 +2128,9 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int tt = cell_color(gx, gy_top, &ct);
                 int tb = cell_color(gx, gy_bot, &cb);
 
-                /* Treat emitter(4), absorber(5), tracer(6), freq(7) as solid colored cells */
-                int tt_solid = (tt == 1 || tt == 4 || tt == 5 || tt == 6 || tt == 7);
-                int tb_solid = (tb == 1 || tb == 4 || tb == 5 || tb == 6 || tb == 7);
+                /* Treat emitter(4), absorber(5), tracer(6), freq(7), portal(8,9,10) as solid colored cells */
+                int tt_solid = (tt == 1 || tt >= 4);
+                int tb_solid = (tb == 1 || tb >= 4);
                 if (tt_solid && tb_solid) {
                     p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
                                  ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
@@ -1992,10 +2204,10 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int tr_t = cell_color(gx1, gy0, &dummy);
                 int bl_t = cell_color(gx0, gy1, &dummy);
                 int br_t = cell_color(gx1, gy1, &dummy);
-                int tl = (tl_t == 1 || tl_t == 4 || tl_t == 5 || tl_t == 6 || tl_t == 7);
-                int tr = (tr_t == 1 || tr_t == 4 || tr_t == 5 || tr_t == 6 || tr_t == 7);
-                int bl = (bl_t == 1 || bl_t == 4 || bl_t == 5 || bl_t == 6 || bl_t == 7);
-                int br = (br_t == 1 || br_t == 4 || br_t == 5 || br_t == 6 || br_t == 7);
+                int tl = (tl_t == 1 || tl_t >= 4);
+                int tr = (tr_t == 1 || tr_t >= 4);
+                int bl = (bl_t == 1 || bl_t >= 4);
+                int br = (br_t == 1 || br_t >= 4);
                 int bits = tl | (tr << 1) | (bl << 2) | (br << 3);
 
                 /* In zone mode, also show zone bg for empty cells */
@@ -2227,10 +2439,12 @@ int main(void) {
         }
         else if (key == 'c' || key == 'C') {
             if (population == 0 && generation == 0) {
-                /* Second clear: also reset zones and emitters/absorbers */
+                /* Second clear: also reset zones, emitters/absorbers, and portals */
                 zones_clear();
                 n_emitters = 0;
                 n_absorbers = 0;
+                n_portals = 0;
+                portal_placing = 0;
             }
             grid_clear();
             running = 0;
@@ -2262,8 +2476,18 @@ int main(void) {
             draw_mode = !draw_mode;
         else if (key == 'g' || key == 'G')
             show_graph = !show_graph;
-        else if (key == 'w' || key == 'W')
+        else if (key == 'w')
             wrap_mode = !wrap_mode;
+        else if (key == 'W') {
+            portal_mode = !portal_mode;
+            if (portal_mode) {
+                portal_placing = 0;
+                emit_mode = 0;
+                zone_mode = 0;
+                draw_mode = 1;
+            }
+            printf("\033[2J"); fflush(stdout);
+        }
         else if (key == 'h' || key == 'H')
             heatmap_mode = !heatmap_mode;
         else if (key == 'f' || key == 'F') {
@@ -2298,7 +2522,8 @@ int main(void) {
             show_minimap = !show_minimap;
         else if (key == 'j' || key == 'J') {
             zone_mode = !zone_mode;
-            emit_mode = 0; /* exit emit mode when entering zone mode */
+            emit_mode = 0;
+            portal_mode = 0; portal_placing = 0;
             if (zone_mode) {
                 draw_mode = 1;
             }
@@ -2306,7 +2531,8 @@ int main(void) {
         }
         else if (key == 'e' || key == 'E') {
             emit_mode = !emit_mode;
-            zone_mode = 0; /* exit zone mode when entering emit mode */
+            zone_mode = 0;
+            portal_mode = 0; portal_placing = 0;
             if (emit_mode) {
                 draw_mode = 1;
             }
@@ -2369,8 +2595,13 @@ int main(void) {
                     goto mouse_done;
             }
 
-            /* Scroll wheel: in emit mode adjusts absorb radius; otherwise zoom */
-            if (emit_mode && m->type == 1 && (btn == 64 || btn == 65)) {
+            /* Scroll wheel: portal radius / emit radius / zoom */
+            if (portal_mode && m->type == 1 && (btn == 64 || btn == 65)) {
+                if (btn == 64)
+                    portal_radius = portal_radius < 6 ? portal_radius + 1 : 6;
+                else
+                    portal_radius = portal_radius > 2 ? portal_radius - 1 : 2;
+            } else if (emit_mode && m->type == 1 && (btn == 64 || btn == 65)) {
                 if (btn == 64)
                     absorb_radius = absorb_radius < 10 ? absorb_radius + 1 : 10;
                 else
@@ -2411,7 +2642,44 @@ int main(void) {
                     gy = view_y + (m->y - 3) * 2;
                 }
 
-                if (emit_mode) {
+                if (portal_mode) {
+                    /* Portal placement: left=place entrance/exit, middle=remove */
+                    if (m->type == 1) {
+                        int mbtn = btn & 0x03;
+                        if (mbtn == 0) {
+                            if (!portal_placing) {
+                                /* First click: set entrance */
+                                portal_wip_x = gx;
+                                portal_wip_y = gy;
+                                portal_placing = 1;
+                            } else {
+                                /* Second click: set exit, create portal pair */
+                                if (n_portals < MAX_PORTALS) {
+                                    portals[n_portals] = (Portal){
+                                        portal_wip_x, portal_wip_y,
+                                        gx, gy,
+                                        portal_radius, 1
+                                    };
+                                    n_portals++;
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "Portal %d created (r=%d)", n_portals, portal_radius);
+                                    flash_set(msg);
+                                }
+                                portal_placing = 0;
+                            }
+                        } else if (mbtn == 2) {
+                            /* Right click: cancel placement or remove nearby */
+                            if (portal_placing) {
+                                portal_placing = 0;
+                            } else {
+                                remove_portal_near(gx, gy);
+                            }
+                        } else if (mbtn == 1) {
+                            remove_portal_near(gx, gy);
+                        }
+                    }
+                    if (m->type == 2) mouse_held = 0;
+                } else if (emit_mode) {
                     /* Emitter/absorber placement: left=emitter, right=absorber, middle=remove */
                     if (m->type == 1) {
                         int mbtn = btn & 0x03;
