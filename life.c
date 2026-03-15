@@ -2,7 +2,7 @@
  * Life-like Cellular Automaton Explorer — terminal edition (C / ANSI)
  *
  * Controls:
- *   SPACE / p   Play / Pause
+ *   SPACE / p   Play / Pause (in replay mode: resume live from current point)
  *   s           Step one generation (while paused)
  *   r           Randomize the grid
  *   c           Clear the grid
@@ -21,6 +21,9 @@
  *                 [/] cycle emit pattern, +/- adjust rate/radius in this mode
  *   z / x       Zoom in / out (3 levels: 1x, 2x half-block, 4x quarter)
  *   n           Toggle minimap overlay (shows full grid + viewport rect when zoomed)
+ *   < / ,       Rewind through history (enter replay mode)
+ *   > / .       Fast-forward through history
+ *   t           Toggle timeline bar display
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
  *   q / ESC     Quit
@@ -215,6 +218,79 @@ static void place_absorber_sym(int gx, int gy) {
 static const char *emit_pattern_names[] = { "dot", "cross", "rand3", "glider" };
 #define N_EMIT_PATTERNS 4
 
+/* ── Timeline (time-travel history) ────────────────────────────────────────── */
+
+#define TL_MAX 256  /* max history frames (~40MB total) */
+
+typedef struct {
+    unsigned char grid[MAX_H][MAX_W];
+    unsigned char ghost[MAX_H][MAX_W];
+    int generation;
+    int population;
+} TimelineFrame;
+
+static TimelineFrame *timeline = NULL; /* heap-allocated ring buffer */
+static int tl_head = 0;     /* next write position */
+static int tl_len = 0;      /* number of stored frames */
+static int replay_mode = 0; /* 0=live, 1=replaying history */
+static int replay_pos = 0;  /* offset from newest: 0=newest, tl_len-1=oldest */
+static int show_timeline = 1; /* show timeline bar */
+
+static void timeline_init(void) {
+    timeline = (TimelineFrame *)malloc(sizeof(TimelineFrame) * TL_MAX);
+    if (!timeline) {
+        fprintf(stderr, "Failed to allocate timeline buffer\n");
+        exit(1);
+    }
+}
+
+/* Save current grid state to timeline */
+static void timeline_push(void) {
+    if (!timeline) return;
+    TimelineFrame *f = &timeline[tl_head];
+    memcpy(f->grid, grid, sizeof(grid));
+    memcpy(f->ghost, ghost, sizeof(ghost));
+    f->generation = generation;
+    f->population = population;
+    tl_head = (tl_head + 1) % TL_MAX;
+    if (tl_len < TL_MAX) tl_len++;
+}
+
+/* Get a historical frame: age=0 is newest, age=tl_len-1 is oldest */
+static TimelineFrame *timeline_get(int age) {
+    if (!timeline || age < 0 || age >= tl_len) return NULL;
+    int idx = (tl_head - 1 - age + TL_MAX * 2) % TL_MAX;
+    return &timeline[idx];
+}
+
+/* Load a historical frame into the live grid */
+static void timeline_restore(int age) {
+    TimelineFrame *f = timeline_get(age);
+    if (!f) return;
+    memcpy(grid, f->grid, sizeof(grid));
+    memcpy(ghost, f->ghost, sizeof(ghost));
+    generation = f->generation;
+    population = f->population;
+}
+
+/* Truncate history newer than replay_pos (for branching) */
+static void timeline_truncate_at(int age) {
+    /* Keep only frames from age onward (discard newer ones) */
+    if (age <= 0) return;
+    /* Move head back by 'age' positions and reduce length */
+    tl_head = (tl_head - age + TL_MAX * 2) % TL_MAX;
+    tl_len -= age;
+    if (tl_len < 0) tl_len = 0;
+}
+
+/* Clear timeline (on grid_clear/randomize) */
+static void timeline_clear(void) {
+    tl_head = 0;
+    tl_len = 0;
+    replay_mode = 0;
+    replay_pos = 0;
+}
+
 /* ── Viewport (zoom + pan) ─────────────────────────────────────────────────── */
 
 static int view_x = 0, view_y = 0;     /* top-left corner in grid coords */
@@ -350,6 +426,7 @@ static void grid_clear(void) {
     population = 0;
     hist_count = 0;
     hist_pos = 0;
+    timeline_clear();
 }
 
 static void zones_clear(void) {
@@ -438,6 +515,7 @@ static void grid_step(void) {
         apply_sources_sinks();
 
     hist_push(population);
+    timeline_push();
 }
 
 static void grid_set(int x, int y) {
@@ -1010,6 +1088,70 @@ static void render_minimap(char **pp) {
     *pp = p;
 }
 
+/* ── Timeline bar rendering ─────────────────────────────────────────────────── */
+
+static void render_timeline_bar(char **pp, int width) {
+    char *p = *pp;
+    if (tl_len < 2 || width < 10) { *pp = p; return; }
+
+    /* Draw a horizontal bar showing position in history */
+    /* Format: ◀━━━━━●━━━━━▶ or ◀━━━━━━━━━━▶ (live) */
+    int bar_w = width - 2; /* minus ◀ and ▶ */
+    if (bar_w > 60) bar_w = 60;
+    if (bar_w < 5) bar_w = 5;
+
+    /* Position: replay_pos maps to bar position */
+    /* replay_pos=0 (newest) → rightmost, replay_pos=tl_len-1 → leftmost */
+    int cursor = bar_w - 1 - (tl_len > 1 ? replay_pos * (bar_w - 1) / (tl_len - 1) : 0);
+    if (cursor < 0) cursor = 0;
+    if (cursor >= bar_w) cursor = bar_w - 1;
+
+    if (replay_mode) {
+        p += sprintf(p, "\033[93m"); /* yellow for replay */
+    } else {
+        p += sprintf(p, "\033[90m"); /* dim for live */
+    }
+
+    /* Left arrow */
+    const char *la = "\xe2\x97\x80"; /* ◀ */
+    while (*la) *p++ = *la++;
+
+    for (int i = 0; i < bar_w; i++) {
+        if (replay_mode && i == cursor) {
+            /* Playhead marker */
+            p += sprintf(p, "\033[97m\xe2\x97\x8f\033[%sm", replay_mode ? "93" : "90"); /* ● */
+        } else {
+            /* Bar segment — brighter near the cursor in replay mode */
+            if (replay_mode) {
+                int dist = abs(i - cursor);
+                if (dist < 3)
+                    p += sprintf(p, "\033[93m\xe2\x94\x81"); /* ━ bright */
+                else
+                    p += sprintf(p, "\033[90m\xe2\x94\x80"); /* ─ dim */
+            } else {
+                p += sprintf(p, "\xe2\x94\x80"); /* ─ */
+            }
+        }
+    }
+
+    /* Right arrow */
+    const char *ra = "\xe2\x96\xb6"; /* ▶ */
+    while (*ra) *p++ = *ra++;
+
+    /* Frame info */
+    if (replay_mode) {
+        TimelineFrame *f = timeline_get(replay_pos);
+        if (f) {
+            p += sprintf(p, " \033[93mGen %d\033[90m (%d/%d)\033[0m",
+                         f->generation, tl_len - replay_pos, tl_len);
+        }
+    } else {
+        p += sprintf(p, " \033[90m%d frames\033[0m", tl_len);
+    }
+    p += sprintf(p, "\033[0m");
+    *pp = p;
+}
+
 /* ── Rendering ─────────────────────────────────────────────────────────────── */
 
 /* Larger buffer for true-color escape sequences */
@@ -1094,7 +1236,9 @@ static void render(int running, int speed_ms, int draw_mode) {
     p += sprintf(p, "\033[H");
 
     /* status bar line 1 */
-    const char *state = running
+    const char *state = replay_mode
+        ? "\033[93m\u23EA REPLAY\033[0m"
+        : running
         ? "\033[92m\u25B6 RUN\033[0m"
         : "\033[93m\u23F8 PAUSE\033[0m";
     const char *wrap_str = wrap_mode
@@ -1175,12 +1319,18 @@ static void render(int running, int speed_ms, int draw_mode) {
         render_sparkline(&p, 40);
     }
 
+    /* Timeline bar inline */
+    if (show_timeline && tl_len > 1) {
+        p += sprintf(p, "  ");
+        render_timeline_bar(&p, 50);
+    }
+
     p += sprintf(p, "\033[K\n");
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
-                     "[/]rule [m]mut [j]zone [e]emit [z/x]zoom [n]map [\u2190\u2191\u2192\u2193]pan [q]quit\033[0m\033[K\n");
+                     "[/]rule [m]mut [j]zone [e]emit [z/x]zoom [n]map [<>]time [t]tbar [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
     if (usable_rows < 5) usable_rows = 5;
@@ -1391,6 +1541,7 @@ static long long now_ms(void) {
 int main(void) {
     srand(time(NULL));
     build_pulsar();
+    timeline_init();
 
     W = MAX_W;
     H = MAX_H;
@@ -1400,6 +1551,7 @@ int main(void) {
 
     grid_randomize(0.25);
     hist_push(population);
+    timeline_push(); /* save initial state */
 
     signal(SIGWINCH, handle_winch);
 
@@ -1424,12 +1576,60 @@ int main(void) {
         int key = read_input();
         if (key == 'q' || key == 'Q' || key == 27 || key == 3)
             break;
-        else if (key == ' ' || key == 'p' || key == 'P')
-            running = !running;
-        else if (key == 's' && !running)
-            grid_step();
+        else if (key == ' ' || key == 'p' || key == 'P') {
+            if (replay_mode) {
+                /* Resume live from this historical point */
+                timeline_restore(replay_pos);
+                timeline_truncate_at(replay_pos);
+                replay_mode = 0;
+                replay_pos = 0;
+                running = 1;
+            } else {
+                running = !running;
+            }
+        }
+        else if (key == 's') {
+            if (replay_mode) {
+                /* Step forward in replay */
+                if (replay_pos > 0) {
+                    replay_pos--;
+                    timeline_restore(replay_pos);
+                }
+            } else if (!running) {
+                grid_step();
+            }
+        }
+        else if (key == '<' || key == ',') {
+            /* Rewind: enter/deepen replay */
+            if (tl_len > 1) {
+                if (!replay_mode) {
+                    replay_mode = 1;
+                    replay_pos = 0;
+                    running = 0;
+                }
+                /* Step backward */
+                if (replay_pos < tl_len - 1) {
+                    replay_pos++;
+                    timeline_restore(replay_pos);
+                }
+            }
+        }
+        else if (key == '>' || key == '.') {
+            if (replay_mode) {
+                if (replay_pos > 0) {
+                    replay_pos--;
+                    timeline_restore(replay_pos);
+                } else {
+                    /* Reached present — exit replay */
+                    replay_mode = 0;
+                }
+            }
+        }
+        else if (key == 't' || key == 'T')
+            show_timeline = !show_timeline;
         else if (key == 'r' || key == 'R') {
             grid_randomize(0.25);
+            timeline_push(); /* save initial state */
             running = 1;
         }
         else if (key == 'c' || key == 'C') {
@@ -1657,7 +1857,7 @@ int main(void) {
         }
 
         long long now = now_ms();
-        if (running && now - last_step >= speed_ms) {
+        if (running && !replay_mode && now - last_step >= speed_ms) {
             grid_step();
             last_step = now;
         }
