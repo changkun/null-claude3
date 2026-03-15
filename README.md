@@ -30,6 +30,7 @@ Requires only `gcc` and a POSIX terminal.
 | `m` | Mutate — randomly flip one birth/survival bit |
 | `k` | Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope) |
 | `z` / `x` | Zoom in / out (1x → 2x half-block → 4x quarter-block) |
+| `n` | Toggle minimap overlay (full-grid thumbnail + viewport rect) |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |
 | `0` | Re-center viewport |
 | `1`–`5` | Load preset pattern |
@@ -84,5 +85,6 @@ shows `(mutant)` when the active rule doesn't match any preset.
 - Toroidal wrapping mode — gliders and patterns loop around edges
 - Kaleidoscope drawing — 2/4/8-fold symmetric mouse painting with reflections around grid center
 - Zoom and pan — 3 zoom levels using Unicode half-block (▀▄) and quarter-block (▘▝▖▗) characters for 2x and 4x density
+- Minimap overlay — quarter-block thumbnail of full grid with yellow viewport rectangle, auto-shows when zoomed
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)

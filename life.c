@@ -17,6 +17,7 @@
  *   m           Mutate — randomly flip one birth/survival bit
  *   k           Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope)
  *   z / x       Zoom in / out (3 levels: 1x, 2x half-block, 4x quarter)
+ *   n           Toggle minimap overlay (shows full grid + viewport rect when zoomed)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
  *   q / ESC     Quit
@@ -58,6 +59,7 @@ static int population;
 static int wrap_mode = 0; /* toroidal wrapping */
 static int heatmap_mode = 1; /* age heatmap + ghost trails (on by default) */
 static int symmetry = 0; /* 0=none, 1=2-fold, 2=4-fold, 3=8-fold */
+static int show_minimap = 1; /* minimap overlay when zoomed */
 
 /* ── Viewport (zoom + pan) ─────────────────────────────────────────────────── */
 
@@ -617,6 +619,131 @@ static void render_sparkline(char **pp, int width) {
     *pp = p;
 }
 
+/* ── Minimap overlay ───────────────────────────────────────────────────────── */
+
+/* Quarter-block chars for minimap (same encoding as zoom 4x) */
+static const char *mm_quad[16] = {
+    " ",
+    "\xe2\x96\x98", "\xe2\x96\x9d", "\xe2\x96\x80",
+    "\xe2\x96\x96", "\xe2\x96\x8c", "\xe2\x96\x9e", "\xe2\x96\x9b",
+    "\xe2\x96\x97", "\xe2\x96\x9a", "\xe2\x96\x90", "\xe2\x96\x9c",
+    "\xe2\x96\x84", "\xe2\x96\x99", "\xe2\x96\x9f", "\xe2\x96\x88",
+};
+
+static void render_minimap(char **pp) {
+    if (zoom == 1 || !show_minimap) return;
+
+    char *p = *pp;
+    int usable_rows = term_rows - 3;
+    if (usable_rows < 10) return;
+
+    /* Minimap size in terminal chars — adaptive to terminal size */
+    int mw = term_cols / 4;
+    int mh = usable_rows / 3;
+    if (mw > 50) mw = 50;
+    if (mh > 25) mh = 25;
+    if (mw < 10 || mh < 5) return;
+
+    /* Subpixel resolution (2x2 per char) */
+    int spw = mw * 2; /* subpixels across (for 400 cols) */
+    int sph = mh * 2; /* subpixels down   (for 200 rows) */
+
+    /* Cells per subpixel (floating point for accurate mapping) */
+    float sx_scale = (float)MAX_W / spw;
+    float sy_scale = (float)MAX_H / sph;
+
+    /* Viewport rectangle in subpixel coords */
+    int vp_l = (int)(view_x / sx_scale);
+    int vp_r = (int)((view_x + view_w) / sx_scale);
+    int vp_t = (int)(view_y / sy_scale);
+    int vp_b = (int)((view_y + view_h) / sy_scale);
+    if (vp_r >= spw) vp_r = spw - 1;
+    if (vp_b >= sph) vp_b = sph - 1;
+
+    /* Position: bottom-right of usable grid area (1-based terminal coords) */
+    int box_w = mw + 2; /* +2 for border chars */
+    int box_h = mh + 2;
+    int col0 = term_cols - box_w + 1;
+    int row0 = 3 + usable_rows - box_h; /* row 3 = first grid row */
+    if (row0 < 3) return;
+
+    /* ── Top border ── */
+    p += sprintf(p, "\033[%d;%dH\033[48;2;20;20;30;90m\xe2\x94\x8c", row0, col0);
+    for (int i = 0; i < mw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+    *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+    p += sprintf(p, "\033[0m");
+
+    /* ── Content rows ── */
+    for (int row = 0; row < mh; row++) {
+        p += sprintf(p, "\033[%d;%dH\033[48;2;20;20;30;90m\xe2\x94\x82\033[0m",
+                     row0 + 1 + row, col0);
+
+        int sy0 = row * 2;
+        int sy1 = sy0 + 1;
+
+        for (int col = 0; col < mw; col++) {
+            int sx0 = col * 2;
+            int sx1 = sx0 + 1;
+
+            /* 4 subpixels: TL(sx0,sy0), TR(sx1,sy0), BL(sx0,sy1), BR(sx1,sy1) */
+            int alive[4] = {0, 0, 0, 0};
+            int border[4] = {0, 0, 0, 0};
+            int spxs[4][2] = {{sx0,sy0},{sx1,sy0},{sx0,sy1},{sx1,sy1}};
+
+            for (int q = 0; q < 4; q++) {
+                int sx = spxs[q][0], sy = spxs[q][1];
+
+                /* Viewport border check */
+                if ((sx >= vp_l && sx <= vp_r && (sy == vp_t || sy == vp_b)) ||
+                    (sy >= vp_t && sy <= vp_b && (sx == vp_l || sx == vp_r)))
+                    border[q] = 1;
+
+                /* Sample grid: check if any cell alive in this subpixel's region */
+                int gx0 = (int)(sx * sx_scale);
+                int gy0 = (int)(sy * sy_scale);
+                int gx1 = (int)((sx + 1) * sx_scale);
+                int gy1 = (int)((sy + 1) * sy_scale);
+                if (gx1 > MAX_W) gx1 = MAX_W;
+                if (gy1 > MAX_H) gy1 = MAX_H;
+
+                for (int gy = gy0; gy < gy1 && !alive[q]; gy++)
+                    for (int gx = gx0; gx < gx1 && !alive[q]; gx++)
+                        if (grid[gy][gx]) alive[q] = 1;
+            }
+
+            int bits = 0;
+            int any_border = 0;
+            for (int q = 0; q < 4; q++) {
+                if (alive[q] || border[q]) bits |= (1 << q);
+                if (border[q]) any_border = 1;
+            }
+
+            /* Color: yellow for viewport rect, dim green for cells, dark bg */
+            if (any_border)
+                p += sprintf(p, "\033[93;48;2;20;20;30m");
+            else if (bits)
+                p += sprintf(p, "\033[38;2;0;140;0;48;2;20;20;30m");
+            else
+                p += sprintf(p, "\033[48;2;20;20;30m");
+
+            const char *ch = mm_quad[bits];
+            while (*ch) *p++ = *ch++;
+            p += sprintf(p, "\033[0m");
+        }
+
+        p += sprintf(p, "\033[48;2;20;20;30;90m\xe2\x94\x82\033[0m");
+    }
+
+    /* ── Bottom border ── */
+    p += sprintf(p, "\033[%d;%dH\033[48;2;20;20;30;90m\xe2\x94\x94",
+                 row0 + 1 + mh, col0);
+    for (int i = 0; i < mw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+    *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+    p += sprintf(p, "\033[0m");
+
+    *pp = p;
+}
+
 /* ── Rendering ─────────────────────────────────────────────────────────────── */
 
 /* Larger buffer for true-color escape sequences */
@@ -673,6 +800,10 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(zoom_str, sizeof(zoom_str),
                  " \033[94m\u2302%dx\033[0m", zoom);
 
+    /* Minimap indicator */
+    const char *map_str = (zoom > 1 && show_minimap)
+        ? " \033[94m\u25A3MAP\033[0m" : "";
+
     /* Rule string */
     char rule_str[32];
     rule_to_string(rule_str, sizeof(rule_str));
@@ -685,9 +816,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, sym_str, zoom_str,
+                 state, wrap_str, draw_str, heat_str, sym_str, zoom_str, map_str,
                  rule_display, generation, population, speed_ms);
 
     /* sparkline right after stats */
@@ -701,7 +832,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
-                     "[/]rule [m]mut [z/x]zoom [\u2190\u2191\u2192\u2193]pan [0]center [q]quit\033[0m\033[K\n");
+                     "[/]rule [m]mut [z/x]zoom [n]map [\u2190\u2191\u2192\u2193]pan [0]center [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
     if (usable_rows < 5) usable_rows = 5;
@@ -827,6 +958,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         }
     }
 
+    /* Minimap overlay (only when zoomed) */
+    render_minimap(&p);
+
     *p = '\0';
 
     (void)!write(STDOUT_FILENO, render_buf, p - render_buf);
@@ -930,6 +1064,8 @@ int main(void) {
             birth_mask = rulesets[current_ruleset].birth;
             survival_mask = rulesets[current_ruleset].survival;
         }
+        else if (key == 'n' || key == 'N')
+            show_minimap = !show_minimap;
         else if (key == 'k' || key == 'K')
             symmetry = (symmetry + 1) % 4;
         else if (key == 'm' || key == 'M') {
