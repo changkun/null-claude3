@@ -12,7 +12,7 @@
  *   +/-         Speed up / slow down
  *   d           Toggle draw mode (left-click=place, right-click=erase)
  *   g           Toggle population sparkline graph
- *   w           Toggle toroidal wrapping
+ *   w           Cycle topology: flat → torus → Klein bottle → Möbius strip → projective plane
  *   h           Toggle heatmap mode (age coloring + ghost trails)
  *   [ / ]       Cycle through rule presets (or zone brush in zone mode)
  *   m           Mutate — randomly flip one birth/survival bit
@@ -141,7 +141,7 @@ static int census_unmatched = 0; /* live cells not part of any recognized patter
 /* Temporary grid to mark already-claimed cells during census scan */
 static unsigned char census_claimed[MAX_H][MAX_W];
 
-/* Forward declaration — defined after grid_step where H/W/wrap_mode are available */
+/* Forward declaration — defined after grid_step where H/W/topology are available */
 static void census_scan(void);
 
 /* ── Genetic Rule Explorer ────────────────────────────────────────────────── */
@@ -171,7 +171,11 @@ static void gene_format_rule(char *buf, int buflen, unsigned short b, unsigned s
 static int W = MAX_W, H = MAX_H; /* simulation always uses full grid */
 static int generation;
 static int population;
-static int wrap_mode = 0; /* toroidal wrapping */
+/* Topology: 0=flat(finite), 1=torus, 2=Klein bottle, 3=Möbius strip, 4=projective plane */
+enum { TOPO_FLAT=0, TOPO_TORUS, TOPO_KLEIN, TOPO_MOBIUS, TOPO_PROJECTIVE, TOPO_COUNT };
+static int topology = 0;
+static const char *topo_names[] = {"flat","torus","Klein","Möbius","proj"};
+static const char *topo_symbols[] = {"","∞","𝕂","𝕄","ℙ"};
 static int heatmap_mode = 1; /* age heatmap + ghost trails (on by default) */
 static int symmetry = 0; /* 0=none, 1=2-fold, 2=4-fold, 3=8-fold */
 static int show_minimap = 1; /* minimap overlay when zoomed */
@@ -340,8 +344,8 @@ static void place_absorber_sym(int gx, int gy) {
 static const char *emit_pattern_names[] = { "dot", "cross", "rand3", "glider" };
 #define N_EMIT_PATTERNS 4
 
-/* Forward declaration for wrap_coord */
-static inline int wrap_coord(int v, int max);
+/* Forward declaration for topology coordinate mapping */
+static inline int topo_map(int *nx, int *ny);
 
 /* ── Wormhole Portals (non-local spatial coupling) ─────────────────────────── */
 
@@ -391,10 +395,7 @@ static int portal_neighbor_count(int x, int y) {
                 for (int dx = -1; dx <= 1; dx++) {
                     if (dx == 0 && dy == 0) continue;
                     int nx = ox + dx, ny = oy + dy;
-                    if (wrap_mode) {
-                        nx = wrap_coord(nx, W);
-                        ny = wrap_coord(ny, H);
-                    } else if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                    if (!topo_map(&nx, &ny)) continue;
                     extra += (grid[ny][nx] > 0);
                 }
         }
@@ -407,10 +408,7 @@ static int portal_neighbor_count(int x, int y) {
                 for (int dx = -1; dx <= 1; dx++) {
                     if (dx == 0 && dy == 0) continue;
                     int nx = ox + dx, ny = oy + dy;
-                    if (wrap_mode) {
-                        nx = wrap_coord(nx, W);
-                        ny = wrap_coord(ny, H);
-                    } else if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                    if (!topo_map(&nx, &ny)) continue;
                     extra += (grid[ny][nx] > 0);
                 }
         }
@@ -655,10 +653,46 @@ static void grid_randomize(double density) {
             }
 }
 
-static inline int wrap_coord(int v, int max) {
-    if (v < 0) return v + max;
-    if (v >= max) return v - max;
-    return v;
+/* Map coordinates through the current topology.
+ * Returns 1 if the coordinate is valid (possibly transformed), 0 if out-of-bounds.
+ *
+ * Topologies and their edge identifications:
+ *   Flat:       no wrapping — edges are boundaries
+ *   Torus:      left↔right, top↔bottom (standard wrapping)
+ *   Klein:      left↔right normal, top↔bottom WITH horizontal flip (x → W-1-x)
+ *   Möbius:     left↔right WITH vertical flip (y → H-1-y), top↔bottom are boundaries
+ *   Projective: left↔right WITH vertical flip, top↔bottom WITH horizontal flip
+ */
+static inline int topo_map(int *nx, int *ny) {
+    int x = *nx, y = *ny;
+    if (topology == TOPO_FLAT) {
+        return (x >= 0 && x < W && y >= 0 && y < H);
+    }
+    if (topology == TOPO_TORUS) {
+        if (x < 0) x += W; else if (x >= W) x -= W;
+        if (y < 0) y += H; else if (y >= H) y -= H;
+    } else if (topology == TOPO_KLEIN) {
+        /* Left/right: normal wrap */
+        if (x < 0) x += W; else if (x >= W) x -= W;
+        /* Top/bottom: wrap with horizontal flip */
+        if (y < 0) { y += H; x = W - 1 - x; }
+        else if (y >= H) { y -= H; x = W - 1 - x; }
+    } else if (topology == TOPO_MOBIUS) {
+        /* Left/right: wrap with vertical flip */
+        if (x < 0) { x += W; y = H - 1 - y; }
+        else if (x >= W) { x -= W; y = H - 1 - y; }
+        /* Top/bottom: boundaries (Möbius strip has open edges) */
+        if (y < 0 || y >= H) return 0;
+    } else if (topology == TOPO_PROJECTIVE) {
+        /* Left/right: wrap with vertical flip */
+        if (x < 0) { x += W; y = H - 1 - y; }
+        else if (x >= W) { x -= W; y = H - 1 - y; }
+        /* Top/bottom: wrap with horizontal flip */
+        if (y < 0) { y += H; x = W - 1 - x; }
+        else if (y >= H) { y -= H; x = W - 1 - x; }
+    }
+    *nx = x; *ny = y;
+    return 1;
 }
 
 static void grid_step(void) {
@@ -674,12 +708,7 @@ static void grid_step(void) {
                 for (int dx = -1; dx <= 1; dx++) {
                     if (dx == 0 && dy == 0) continue;
                     int nx = x + dx, ny = y + dy;
-                    if (wrap_mode) {
-                        nx = wrap_coord(nx, W);
-                        ny = wrap_coord(ny, H);
-                    } else if (nx < 0 || nx >= W || ny < 0 || ny >= H) {
-                        continue;
-                    }
+                    if (!topo_map(&nx, &ny)) continue;
                     if (grid[ny][nx] > 0) {
                         n++;
                         if (ecosystem_mode) {
@@ -835,9 +864,9 @@ static void census_scan(void) {
                     int gx2 = (x + px + W) % W;
                     int gy_top = (y - 1 + H) % H;
                     int gy_bot = (y + pat->h) % H;
-                    if (wrap_mode || y > 0)
+                    if (topology != TOPO_FLAT || y > 0)
                         if (grid[gy_top][gx2]) match = 0;
-                    if (wrap_mode || y + pat->h < H)
+                    if (topology != TOPO_FLAT || y + pat->h < H)
                         if (grid[gy_bot][gx2]) match = 0;
                 }
                 /* Check left/right border columns */
@@ -845,9 +874,9 @@ static void census_scan(void) {
                     int gy2 = (y + py) % H;
                     int gx_left = (x - 1 + W) % W;
                     int gx_right = (x + pat->w) % W;
-                    if (wrap_mode || x > 0)
+                    if (topology != TOPO_FLAT || x > 0)
                         if (grid[gy2][gx_left]) match = 0;
-                    if (wrap_mode || x + pat->w < W)
+                    if (topology != TOPO_FLAT || x + pat->w < W)
                         if (grid[gy2][gx_right]) match = 0;
                 }
                 if (!match) continue;
@@ -1777,7 +1806,7 @@ static void freq_analyze(void) {
  *   1 byte:  version (1)
  *   2 bytes: birth_mask (LE)
  *   2 bytes: survival_mask (LE)
- *   1 byte:  symmetry, wrap_mode, heatmap_mode, zone_enabled
+ *   1 byte:  symmetry, topology, heatmap_mode, zone_enabled
  *   4 bytes: generation, population (LE)
  *   1 byte:  n_emitters, n_absorbers
  *   grids: grid, ghost, zone (MAX_H*MAX_W each)
@@ -1973,7 +2002,7 @@ static void save_state(void) {
     write_u16(f, birth_mask);
     write_u16(f, survival_mask);
     fputc(symmetry, f);
-    fputc(wrap_mode, f);
+    fputc(topology, f);
     fputc(heatmap_mode, f);
     fputc(zone_enabled, f);
     write_i32(f, generation);
@@ -2039,7 +2068,8 @@ static void load_state(int slot) {
     birth_mask = read_u16(f);
     survival_mask = read_u16(f);
     symmetry = fgetc(f);
-    wrap_mode = fgetc(f);
+    topology = fgetc(f);
+    if (topology >= TOPO_COUNT) topology = TOPO_FLAT; /* compat: clamp invalid values */
     heatmap_mode = fgetc(f);
     zone_enabled = fgetc(f);
     generation = read_i32(f);
@@ -2808,9 +2838,11 @@ static void render(int running, int speed_ms, int draw_mode) {
         : running
         ? "\033[92m\u25B6 RUN\033[0m"
         : "\033[93m\u23F8 PAUSE\033[0m";
-    const char *wrap_str = wrap_mode
-        ? " \033[95m\u221E\033[0m"
-        : "";
+    char topo_str[64] = "";
+    if (topology > TOPO_FLAT) {
+        snprintf(topo_str, sizeof(topo_str),
+                 " \033[95m%s%s\033[0m", topo_symbols[topology], topo_names[topology]);
+    }
     const char *draw_str = draw_mode
         ? " \033[96m\u270E DRAW\033[0m"
         : "";
@@ -2946,7 +2978,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, tracer_str, freq_str, census_str, gene_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, census_str, gene_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -2970,7 +3002,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace [f]freq "
+                     "[1-5]pre [d]draw [k]sym [g]graph [w]topo [h]heat [T]trace [f]freq "
                      "[/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
@@ -3658,7 +3690,7 @@ int main(void) {
         else if (key == 'g' || key == 'G')
             show_graph = !show_graph;
         else if (key == 'w')
-            wrap_mode = !wrap_mode;
+            topology = (topology + 1) % TOPO_COUNT;
         else if (key == 'W') {
             portal_mode = !portal_mode;
             if (portal_mode) {
