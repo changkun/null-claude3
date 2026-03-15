@@ -25,6 +25,7 @@
  *   < / ,       Rewind through history (enter replay mode)
  *   > / .       Fast-forward through history
  *   t           Toggle timeline bar display
+ *   T           Cycle signal tracer: off → accumulate → frozen → clear+off
  *   Ctrl-S      Save state to numbered .life file
  *   Ctrl-O      Load most recent .life save (or Ctrl-O N for slot N)
  *   Arrow keys  Pan viewport across the full 400×200 grid
@@ -65,6 +66,10 @@ static unsigned char zone[MAX_H][MAX_W]; /* default 0 = first ruleset */
 /* ghost trails: 0=none, 1..GHOST_FRAMES=fading (GHOST_FRAMES=just died) */
 #define GHOST_FRAMES 5
 static unsigned char ghost[MAX_H][MAX_W];
+
+/* signal tracer: accumulates cell presence over time (0-255) */
+static unsigned char tracer[MAX_H][MAX_W];
+static int tracer_mode = 0; /* 0=off, 1=accumulating, 2=frozen (visible but not growing) */
 
 static int W = MAX_W, H = MAX_H; /* simulation always uses full grid */
 static int generation;
@@ -430,6 +435,7 @@ static int find_matching_ruleset(void) {
 static void grid_clear(void) {
     memset(grid, 0, sizeof(grid));
     memset(ghost, 0, sizeof(ghost));
+    memset(tracer, 0, sizeof(tracer));
     /* zones are preserved across clear — use 'c' twice or toggle zone_mode to reset */
     generation = 0;
     population = 0;
@@ -518,6 +524,14 @@ static void grid_step(void) {
 
     memcpy(grid, next_grid, sizeof(grid));
     generation++;
+
+    /* Accumulate signal tracer */
+    if (tracer_mode == 1) {
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                if (grid[y][x] && tracer[y][x] < 255)
+                    tracer[y][x]++;
+    }
 
     /* Apply emitters and absorbers after step */
     if (n_emitters > 0 || n_absorbers > 0)
@@ -827,6 +841,25 @@ static RGB ghost_to_rgb(int g) {
     int brightness = 30 + (g * 50) / GHOST_FRAMES; /* 30..80 */
     int blue_tint  = 40 + (g * 60) / GHOST_FRAMES; /* 40..100 */
     return (RGB){ brightness, brightness, blue_tint };
+}
+
+/* Signal tracer: purple→magenta→pink gradient (distinct from thermal heatmap) */
+static RGB tracer_to_rgb(int t) {
+    /* t ranges from 1 (barely visited) to 255 (heavily visited) */
+    /* Gradient stops: dark indigo → violet → magenta → hot pink */
+    if (t <= 8) {
+        return (RGB){ (unsigned char)(15 + t*2), (unsigned char)(5 + t), (unsigned char)(30 + t*3) };
+    } else if (t <= 40) {
+        float f = (float)(t - 8) / 32.0f;
+        return (RGB){ (unsigned char)(31 + f*89), (unsigned char)(13 + f*17), (unsigned char)(54 + f*106) };
+    } else if (t <= 120) {
+        float f = (float)(t - 40) / 80.0f;
+        return (RGB){ (unsigned char)(120 + f*100), (unsigned char)(30 + f*20), (unsigned char)(160 + f*40) };
+    } else {
+        float f = (float)(t - 120) / 135.0f;
+        if (f > 1.0f) f = 1.0f;
+        return (RGB){ (unsigned char)(220 + f*35), (unsigned char)(50 + f*50), (unsigned char)(200 + f*55) };
+    }
 }
 
 /* ── Save / Load (.life files) ─────────────────────────────────────────────── */
@@ -1235,7 +1268,8 @@ static void render_minimap(char **pp) {
 
                 for (int gy = gy0; gy < gy1 && !alive[q]; gy++)
                     for (int gx = gx0; gx < gx1 && !alive[q]; gx++)
-                        if (grid[gy][gx]) alive[q] = 1;
+                        if (grid[gy][gx] || (tracer_mode > 0 && tracer[gy][gx] > 10))
+                            alive[q] = 1;
             }
 
             int bits = 0;
@@ -1551,6 +1585,11 @@ static int cell_color(int x, int y, RGB *out) {
         *out = ghost_to_rgb(ghost[y][x]);
         return 2; /* ghost */
     }
+    /* Signal tracer underlay: show trails for dead cells */
+    if (tracer_mode > 0 && tracer[y][x] > 0) {
+        *out = tracer_to_rgb(tracer[y][x]);
+        return 6; /* tracer trail */
+    }
     /* Show zone background tint when in zone mode */
     if (zone_enabled && zone_mode) {
         RGB zc = zone_colors[zone[y][x] % N_RULESETS];
@@ -1590,6 +1629,15 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(sym_str, sizeof(sym_str),
                  " \033[93m\u2735SYM:%d\033[0m", folds[symmetry]);
     }
+
+    /* Tracer indicator */
+    char tracer_str[48] = "";
+    if (tracer_mode == 1)
+        snprintf(tracer_str, sizeof(tracer_str),
+                 " \033[38;2;220;80;200m\u2593TRACE\033[0m");
+    else if (tracer_mode == 2)
+        snprintf(tracer_str, sizeof(tracer_str),
+                 " \033[38;2;120;30;160m\u2593TRACE:FRZ\033[0m");
 
     /* Zoom indicator */
     char zoom_str[32] = "";
@@ -1642,9 +1690,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, sym_str, zoom_str, map_str, zone_str,
+                 state, wrap_str, draw_str, heat_str, tracer_str, sym_str, zoom_str, map_str, zone_str,
                  emit_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -1668,7 +1716,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
+                     "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace "
                      "[/]rule [m]mut [b]edit [j]zone [e]emit [z/x]zoom [n]map [<>]time [t]tbar "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
@@ -1695,6 +1743,9 @@ static void render(int running, int speed_ms, int draw_mode) {
                 } else if (t == 5) {
                     /* Absorber: dark vortex marker */
                     p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xe2\x97\x8b \033[0m", c.r/3, c.g/3, c.b/3);
+                } else if (t == 6) {
+                    /* Tracer trail: colored background */
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
                 } else {
                     *p++ = ' '; *p++ = ' ';
                 }
@@ -1714,9 +1765,9 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int tt = cell_color(gx, gy_top, &ct);
                 int tb = cell_color(gx, gy_bot, &cb);
 
-                /* Treat emitter(4) and absorber(5) as solid colored cells */
-                int tt_solid = (tt == 1 || tt == 4 || tt == 5);
-                int tb_solid = (tb == 1 || tb == 4 || tb == 5);
+                /* Treat emitter(4), absorber(5), tracer(6) as solid colored cells */
+                int tt_solid = (tt == 1 || tt == 4 || tt == 5 || tt == 6);
+                int tb_solid = (tb == 1 || tb == 4 || tb == 5 || tb == 6);
                 if (tt_solid && tb_solid) {
                     p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
                                  ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
@@ -1790,10 +1841,10 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int tr_t = cell_color(gx1, gy0, &dummy);
                 int bl_t = cell_color(gx0, gy1, &dummy);
                 int br_t = cell_color(gx1, gy1, &dummy);
-                int tl = (tl_t == 1 || tl_t == 4 || tl_t == 5);
-                int tr = (tr_t == 1 || tr_t == 4 || tr_t == 5);
-                int bl = (bl_t == 1 || bl_t == 4 || bl_t == 5);
-                int br = (br_t == 1 || br_t == 4 || br_t == 5);
+                int tl = (tl_t == 1 || tl_t == 4 || tl_t == 5 || tl_t == 6);
+                int tr = (tr_t == 1 || tr_t == 4 || tr_t == 5 || tr_t == 6);
+                int bl = (bl_t == 1 || bl_t == 4 || bl_t == 5 || bl_t == 6);
+                int br = (br_t == 1 || br_t == 4 || br_t == 5 || br_t == 6);
                 int bits = tl | (tr << 1) | (bl << 2) | (br << 3);
 
                 /* In zone mode, also show zone bg for empty cells */
@@ -1968,8 +2019,14 @@ int main(void) {
                 }
             }
         }
-        else if (key == 't' || key == 'T')
+        else if (key == 't')
             show_timeline = !show_timeline;
+        else if (key == 'T') {
+            /* Cycle tracer: off(0) → accumulate(1) → frozen(2) → off+clear(0) */
+            tracer_mode = (tracer_mode + 1) % 3;
+            if (tracer_mode == 0)
+                memset(tracer, 0, sizeof(tracer));
+        }
         else if (key == 19) /* Ctrl-S: save */
             save_state();
         else if (key == 15) { /* Ctrl-O: load */

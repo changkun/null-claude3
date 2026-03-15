@@ -38,6 +38,7 @@ Requires only `gcc` and a POSIX terminal.
 | `<` / `,` | Rewind through history (enters replay mode) |
 | `>` / `.` | Fast-forward through history |
 | `t` | Toggle timeline scrubber bar |
+| `T` | Cycle signal tracer: off → accumulate → frozen → clear+off |
 | `Ctrl-S` | Save state to numbered `.life` file |
 | `Ctrl-O` | Load most recent `.life` save |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |
@@ -141,6 +142,22 @@ The status bar shows `⏪ REPLAY` when browsing history. The timeline scrubber d
 playhead (`●`) showing your position. Pressing SPACE at any point **branches** — it restores
 that historical state, truncates the future, and resumes live simulation from there. This
 lets you rewind to a critical moment, change parameters, and compare outcomes.
+
+## Signal Tracer
+
+Press `T` to cycle through tracer modes:
+
+1. **Off** (default) — no trail rendering
+2. **Accumulate** — alive cells build up trail intensity each generation. Dead cells display
+   a purple-to-pink gradient showing where structures have traveled. Glider streams become
+   visible rivers, emitter outputs become flow fields, and zone boundaries show collision patterns.
+3. **Frozen** — trails remain visible but stop accumulating, letting you observe existing
+   trails while the simulation continues evolving underneath
+4. Press `T` again to clear all trails and return to off
+
+The tracer uses a distinct purple→magenta→pink palette so it doesn't conflict with the
+thermal heatmap (blue→red→white). Combine with 8-fold symmetry and emitters for stunning
+mandala-like trail art.
 
 ## Save & Load
 
