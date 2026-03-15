@@ -24,6 +24,7 @@ Requires only `gcc` and a POSIX terminal.
 | `w` | Toggle toroidal wrapping (∞ indicator) |
 | `d` | Toggle draw mode (mouse painting) |
 | `g` | Toggle population sparkline graph |
+| `h` | Toggle heatmap mode (age coloring + ghost trails) |
 | `1`–`5` | Load preset pattern |
 | `+` / `-` | Speed up / slow down (20ms–1000ms) |
 | `q` / `ESC` | Quit |
@@ -48,7 +49,9 @@ Requires only `gcc` and a POSIX terminal.
 - Double-buffered grid updates for correct neighbor counting
 - Single-write rendering via pre-built output buffer (~60fps)
 - SIGWINCH handler for live terminal resize
-- Color-cycling alive cells (6-color palette)
+- Cell-age heatmap with 24-bit true-color thermal gradient (blue → cyan → green → yellow → red → white)
+- Ghost trails: fading markers where cells die (5-frame decay with gray-blue tint)
+- Legacy color-cycling mode (6-color palette) available via `h` toggle
 - SGR extended mouse protocol (1006) for large terminal support
 - Population sparkline using Unicode block elements (▁▂▃▅▇█) with red→yellow→green color gradient
 - Toroidal wrapping mode — gliders and patterns loop around edges

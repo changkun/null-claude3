@@ -12,6 +12,7 @@
  *   d           Toggle draw mode (left-click=place, right-click=erase)
  *   g           Toggle population sparkline graph
  *   w           Toggle toroidal wrapping
+ *   h           Toggle heatmap mode (age coloring + ghost trails)
  *   q / ESC     Quit
  *
  *   Mouse:      Left-click to place cells, right-click to erase
@@ -36,12 +37,19 @@
 #define MAX_W 400
 #define MAX_H 200
 
+/* grid stores cell age: 0=dead, 1+=generations alive (capped at 255) */
 static unsigned char grid[MAX_H][MAX_W];
 static unsigned char next_grid[MAX_H][MAX_W];
+
+/* ghost trails: 0=none, 1..GHOST_FRAMES=fading (GHOST_FRAMES=just died) */
+#define GHOST_FRAMES 5
+static unsigned char ghost[MAX_H][MAX_W];
+
 static int W, H;
 static int generation;
 static int population;
 static int wrap_mode = 0; /* toroidal wrapping */
+static int heatmap_mode = 1; /* age heatmap + ghost trails (on by default) */
 
 /* ── Population history (for sparkline) ────────────────────────────────────── */
 
@@ -67,6 +75,7 @@ static int hist_get(int age) {
 
 static void grid_clear(void) {
     memset(grid, 0, sizeof(grid));
+    memset(ghost, 0, sizeof(ghost));
     generation = 0;
     population = 0;
     hist_count = 0;
@@ -92,6 +101,7 @@ static inline int wrap_coord(int v, int max) {
 static void grid_step(void) {
     population = 0;
     memset(next_grid, 0, sizeof(next_grid));
+
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             int n = 0;
@@ -102,18 +112,37 @@ static void grid_step(void) {
                     if (wrap_mode) {
                         nx = wrap_coord(nx, W);
                         ny = wrap_coord(ny, H);
-                        n += grid[ny][nx];
+                        n += (grid[ny][nx] > 0);
                     } else {
                         if (nx >= 0 && nx < W && ny >= 0 && ny < H)
-                            n += grid[ny][nx];
+                            n += (grid[ny][nx] > 0);
                     }
                 }
             if (n == 3 || (n == 2 && grid[y][x])) {
-                next_grid[y][x] = 1;
+                /* alive: increment age, cap at 255 */
+                int age = grid[y][x];
+                next_grid[y][x] = (age < 255) ? age + 1 : 255;
                 population++;
             }
         }
     }
+
+    /* Update ghost trails */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (grid[y][x] && !next_grid[y][x]) {
+                /* cell just died — start ghost trail */
+                ghost[y][x] = GHOST_FRAMES;
+            } else if (next_grid[y][x]) {
+                /* cell is alive — no ghost */
+                ghost[y][x] = 0;
+            } else if (ghost[y][x] > 0) {
+                /* existing ghost — decay */
+                ghost[y][x]--;
+            }
+        }
+    }
+
     memcpy(grid, next_grid, sizeof(grid));
     generation++;
     hist_push(population);
@@ -122,6 +151,7 @@ static void grid_step(void) {
 static void grid_set(int x, int y) {
     if (x >= 0 && x < W && y >= 0 && y < H && !grid[y][x]) {
         grid[y][x] = 1;
+        ghost[y][x] = 0;
         population++;
     }
 }
@@ -129,6 +159,7 @@ static void grid_set(int x, int y) {
 static void grid_unset(int x, int y) {
     if (x >= 0 && x < W && y >= 0 && y < H && grid[y][x]) {
         grid[y][x] = 0;
+        ghost[y][x] = GHOST_FRAMES;
         population--;
     }
 }
@@ -328,7 +359,7 @@ static int read_input(void) {
     return c;
 }
 
-/* ── Color palette (cycles each generation) ────────────────────────────────── */
+/* ── Color palette (legacy flat color, cycles each generation) ─────────────── */
 
 static const char *alive_colors[] = {
     "\033[42m",   /* green */
@@ -339,6 +370,58 @@ static const char *alive_colors[] = {
     "\033[103m",  /* bright yellow */
 };
 #define N_COLORS 6
+
+/* ── Thermal heatmap: age → RGB ────────────────────────────────────────────── */
+
+typedef struct { unsigned char r, g, b; } RGB;
+
+/* Thermal gradient stops:
+ *   age  1: blue      (30,  60,  255)
+ *   age  5: cyan      (0,   220, 255)
+ *   age 12: green     (0,   255, 80)
+ *   age 25: yellow    (255, 255, 0)
+ *   age 50: red       (255, 40,  0)
+ *   age 80+: white    (255, 255, 255)
+ */
+static const int    heat_ages[] = { 1,   5,   12,  25,  50,  80 };
+static const RGB heat_colors[] = {
+    { 30,  60, 255},   /* blue */
+    {  0, 220, 255},   /* cyan */
+    {  0, 255,  80},   /* green */
+    {255, 255,   0},   /* yellow */
+    {255,  40,   0},   /* red */
+    {255, 255, 255},   /* white-hot */
+};
+#define N_HEAT_STOPS 6
+
+static RGB age_to_rgb(int age) {
+    if (age <= heat_ages[0])
+        return heat_colors[0];
+    if (age >= heat_ages[N_HEAT_STOPS - 1])
+        return heat_colors[N_HEAT_STOPS - 1];
+
+    for (int i = 0; i < N_HEAT_STOPS - 1; i++) {
+        if (age <= heat_ages[i + 1]) {
+            int a0 = heat_ages[i], a1 = heat_ages[i + 1];
+            float t = (float)(age - a0) / (float)(a1 - a0);
+            RGB c0 = heat_colors[i], c1 = heat_colors[i + 1];
+            RGB out;
+            out.r = (unsigned char)(c0.r + t * (c1.r - c0.r));
+            out.g = (unsigned char)(c0.g + t * (c1.g - c0.g));
+            out.b = (unsigned char)(c0.b + t * (c1.b - c0.b));
+            return out;
+        }
+    }
+    return heat_colors[N_HEAT_STOPS - 1];
+}
+
+/* Ghost trail colors: fading gray/blue */
+static RGB ghost_to_rgb(int g) {
+    /* g ranges from GHOST_FRAMES (just died, brightest) to 1 (about to vanish) */
+    int brightness = 30 + (g * 50) / GHOST_FRAMES; /* 30..80 */
+    int blue_tint  = 40 + (g * 60) / GHOST_FRAMES; /* 40..100 */
+    return (RGB){ brightness, brightness, blue_tint };
+}
 
 /* ── Sparkline rendering ───────────────────────────────────────────────────── */
 
@@ -394,7 +477,8 @@ static void render_sparkline(char **pp, int width) {
 
 /* ── Rendering ─────────────────────────────────────────────────────────────── */
 
-static char render_buf[MAX_H * MAX_W * 20 + 8192];
+/* Larger buffer for true-color escape sequences */
+static char render_buf[MAX_H * MAX_W * 40 + 16384];
 
 static void render(int running, int speed_ms, int draw_mode) {
     char *p = render_buf;
@@ -412,9 +496,12 @@ static void render(int running, int speed_ms, int draw_mode) {
     const char *draw_str = draw_mode
         ? " \033[96m\u270E DRAW\033[0m"
         : "";
-    p += sprintf(p, " %s%s%s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    const char *heat_str = heatmap_mode
+        ? " \033[91m\u2588HEAT\033[0m"
+        : "";
+    p += sprintf(p, " %s%s%s%s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, generation, population, speed_ms);
+                 state, wrap_str, draw_str, heat_str, generation, population, speed_ms);
 
     /* sparkline right after stats */
     if (show_graph && hist_count > 1) {
@@ -426,23 +513,43 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [g]graph [w]wrap [+/-]spd [q]quit\033[0m\033[K\n");
+                     "[1-5]pre [d]draw [g]graph [w]wrap [h]heat [+/-]spd [q]quit\033[0m\033[K\n");
 
-    const char *color = alive_colors[generation % N_COLORS];
-
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
-            if (grid[y][x]) {
-                const char *c = color;
-                while (*c) *p++ = *c++;
-                *p++ = ' '; *p++ = ' ';
-                *p++ = '\033'; *p++ = '['; *p++ = '0'; *p++ = 'm';
-            } else {
-                *p++ = ' '; *p++ = ' ';
+    if (heatmap_mode) {
+        /* ── Heatmap rendering with true-color ── */
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (grid[y][x]) {
+                    RGB c = age_to_rgb(grid[y][x]);
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
+                } else if (ghost[y][x]) {
+                    RGB c = ghost_to_rgb(ghost[y][x]);
+                    /* Ghost: foreground dot on black background */
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7 \033[0m", c.r, c.g, c.b);
+                } else {
+                    *p++ = ' '; *p++ = ' ';
+                }
             }
+            *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
         }
-        *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
+    } else {
+        /* ── Legacy flat-color rendering ── */
+        const char *color = alive_colors[generation % N_COLORS];
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (grid[y][x]) {
+                    const char *c = color;
+                    while (*c) *p++ = *c++;
+                    *p++ = ' '; *p++ = ' ';
+                    *p++ = '\033'; *p++ = '['; *p++ = '0'; *p++ = 'm';
+                } else {
+                    *p++ = ' '; *p++ = ' ';
+                }
+            }
+            *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
+        }
     }
+
     *p = '\0';
 
     (void)!write(STDOUT_FILENO, render_buf, p - render_buf);
@@ -468,14 +575,19 @@ static void apply_resize(void) {
     if (nh < 5) nh = 5;
 
     unsigned char tmp[MAX_H][MAX_W];
+    unsigned char tmp_ghost[MAX_H][MAX_W];
     memcpy(tmp, grid, sizeof(grid));
+    memcpy(tmp_ghost, ghost, sizeof(ghost));
     memset(grid, 0, sizeof(grid));
+    memset(ghost, 0, sizeof(ghost));
     population = 0;
     int mw = nw < W ? nw : W;
     int mh = nh < H ? nh : H;
     for (int y = 0; y < mh; y++)
-        for (int x = 0; x < mw; x++)
-            if (tmp[y][x]) { grid[y][x] = 1; population++; }
+        for (int x = 0; x < mw; x++) {
+            if (tmp[y][x]) { grid[y][x] = tmp[y][x]; population++; }
+            ghost[y][x] = tmp_ghost[y][x];
+        }
 
     W = nw;
     H = nh;
@@ -554,6 +666,8 @@ int main(void) {
             show_graph = !show_graph;
         else if (key == 'w' || key == 'W')
             wrap_mode = !wrap_mode;
+        else if (key == 'h' || key == 'H')
+            heatmap_mode = !heatmap_mode;
         else if (key == -2 && draw_mode) {
             /* Mouse event */
             MouseEvent *m = &last_mouse;
