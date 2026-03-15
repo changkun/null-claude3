@@ -37,6 +37,8 @@ Requires only `gcc` and a POSIX terminal.
 | `<` / `,` | Rewind through history (enters replay mode) |
 | `>` / `.` | Fast-forward through history |
 | `t` | Toggle timeline scrubber bar |
+| `Ctrl-S` | Save state to numbered `.life` file |
+| `Ctrl-O` | Load most recent `.life` save |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |
 | `0` | Re-center viewport |
 | `1`–`5` | Load preset pattern |
@@ -126,6 +128,17 @@ playhead (`●`) showing your position. Pressing SPACE at any point **branches**
 that historical state, truncates the future, and resumes live simulation from there. This
 lets you rewind to a critical moment, change parameters, and compare outcomes.
 
+## Save & Load
+
+Press `Ctrl-S` to save the full simulation state to a numbered `.life` file (`save_001.life`,
+`save_002.life`, etc.). Press `Ctrl-O` to load the most recent save. Everything is preserved:
+grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmetry, and wrapping.
+
+- Saves use a compact binary format with magic header and version byte
+- Auto-numbered slots (up to 999) prevent accidental overwrites
+- Status bar flashes green confirmation on save/load
+- Enables sharing interesting configurations and resuming experiments
+
 ## Implementation Details
 
 - Double-buffered grid updates for correct neighbor counting
@@ -143,5 +156,6 @@ lets you rewind to a critical moment, change parameters, and compare outcomes.
 - Minimap overlay — quarter-block thumbnail of full grid with yellow viewport rectangle, auto-shows when zoomed
 - Emitters and absorbers — placeable cell sources (dot, cross, random, glider patterns) and circular kill zones for open dissipative dynamics
 - Time-travel replay — 256-frame history ring buffer with rewind/fast-forward, timeline scrubber bar, and branching from any historical point
+- Save/load — binary `.life` files preserving full state (grid, zones, emitters, absorbers, settings) with auto-numbered slots and status flash feedback
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)

@@ -24,6 +24,8 @@
  *   < / ,       Rewind through history (enter replay mode)
  *   > / .       Fast-forward through history
  *   t           Toggle timeline bar display
+ *   Ctrl-S      Save state to numbered .life file
+ *   Ctrl-O      Load most recent .life save (or Ctrl-O N for slot N)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
  *   q / ESC     Quit
@@ -820,6 +822,180 @@ static RGB ghost_to_rgb(int g) {
     return (RGB){ brightness, brightness, blue_tint };
 }
 
+/* ── Save / Load (.life files) ─────────────────────────────────────────────── */
+
+/*
+ * File format (binary):
+ *   4 bytes: magic "LIFE"
+ *   1 byte:  version (1)
+ *   2 bytes: birth_mask (LE)
+ *   2 bytes: survival_mask (LE)
+ *   1 byte:  symmetry, wrap_mode, heatmap_mode, zone_enabled
+ *   4 bytes: generation, population (LE)
+ *   1 byte:  n_emitters, n_absorbers
+ *   grids: grid, ghost, zone (MAX_H*MAX_W each)
+ *   emitters (4×int32 each), absorbers (3×int32 each)
+ */
+
+#define SAVE_MAGIC "LIFE"
+#define SAVE_VERSION 1
+
+static char flash_msg[128] = "";
+static long long flash_until = 0;
+
+static void flash_set(const char *msg) {
+    snprintf(flash_msg, sizeof(flash_msg), "%s", msg);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    flash_until = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + 2000;
+}
+
+static int flash_active(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return now < flash_until;
+}
+
+static int next_save_slot(void) {
+    char path[64];
+    for (int slot = 1; slot <= 999; slot++) {
+        snprintf(path, sizeof(path), "save_%03d.life", slot);
+        if (access(path, F_OK) != 0) return slot;
+    }
+    return 999;
+}
+
+static int latest_save_slot(void) {
+    char path[64];
+    for (int slot = 999; slot >= 1; slot--) {
+        snprintf(path, sizeof(path), "save_%03d.life", slot);
+        if (access(path, F_OK) == 0) return slot;
+    }
+    return 0;
+}
+
+static void write_u16(FILE *f, unsigned short v) {
+    fputc(v & 0xFF, f);
+    fputc((v >> 8) & 0xFF, f);
+}
+
+static void write_i32(FILE *f, int v) {
+    unsigned int u = (unsigned int)v;
+    fputc(u & 0xFF, f); fputc((u >> 8) & 0xFF, f);
+    fputc((u >> 16) & 0xFF, f); fputc((u >> 24) & 0xFF, f);
+}
+
+static unsigned short read_u16(FILE *f) {
+    int lo = fgetc(f), hi = fgetc(f);
+    return (unsigned short)((hi << 8) | lo);
+}
+
+static int read_i32(FILE *f) {
+    int b0 = fgetc(f), b1 = fgetc(f), b2 = fgetc(f), b3 = fgetc(f);
+    return (int)((unsigned int)b0 | ((unsigned int)b1 << 8) |
+                 ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24));
+}
+
+static void save_state(void) {
+    int slot = next_save_slot();
+    char path[64];
+    snprintf(path, sizeof(path), "save_%03d.life", slot);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { flash_set("Save failed!"); return; }
+
+    fwrite(SAVE_MAGIC, 1, 4, f);
+    fputc(SAVE_VERSION, f);
+    write_u16(f, birth_mask);
+    write_u16(f, survival_mask);
+    fputc(symmetry, f);
+    fputc(wrap_mode, f);
+    fputc(heatmap_mode, f);
+    fputc(zone_enabled, f);
+    write_i32(f, generation);
+    write_i32(f, population);
+    fputc((unsigned char)n_emitters, f);
+    fputc((unsigned char)n_absorbers, f);
+
+    fwrite(grid, 1, sizeof(grid), f);
+    fwrite(ghost, 1, sizeof(ghost), f);
+    fwrite(zone, 1, sizeof(zone), f);
+
+    for (int i = 0; i < n_emitters; i++) {
+        write_i32(f, emitters[i].x); write_i32(f, emitters[i].y);
+        write_i32(f, emitters[i].rate); write_i32(f, emitters[i].pattern);
+    }
+    for (int i = 0; i < n_absorbers; i++) {
+        write_i32(f, absorbers[i].x); write_i32(f, absorbers[i].y);
+        write_i32(f, absorbers[i].radius);
+    }
+
+    fclose(f);
+    char msg[80];
+    snprintf(msg, sizeof(msg), "Saved %s", path);
+    flash_set(msg);
+}
+
+static void load_state(int slot) {
+    if (slot <= 0) slot = latest_save_slot();
+    if (slot <= 0) { flash_set("No saves found"); return; }
+
+    char path[64];
+    snprintf(path, sizeof(path), "save_%03d.life", slot);
+    FILE *f = fopen(path, "rb");
+    if (!f) { flash_set("Load failed!"); return; }
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, SAVE_MAGIC, 4) != 0) {
+        fclose(f); flash_set("Bad save file"); return;
+    }
+    if (fgetc(f) != SAVE_VERSION) {
+        fclose(f); flash_set("Unknown save version"); return;
+    }
+
+    birth_mask = read_u16(f);
+    survival_mask = read_u16(f);
+    symmetry = fgetc(f);
+    wrap_mode = fgetc(f);
+    heatmap_mode = fgetc(f);
+    zone_enabled = fgetc(f);
+    generation = read_i32(f);
+    population = read_i32(f);
+    n_emitters = fgetc(f);
+    n_absorbers = fgetc(f);
+    if (n_emitters > MAX_EMITTERS) n_emitters = MAX_EMITTERS;
+    if (n_absorbers > MAX_ABSORBERS) n_absorbers = MAX_ABSORBERS;
+
+    (void)!fread(grid, 1, sizeof(grid), f);
+    (void)!fread(ghost, 1, sizeof(ghost), f);
+    (void)!fread(zone, 1, sizeof(zone), f);
+
+    for (int i = 0; i < n_emitters; i++) {
+        emitters[i].x = read_i32(f); emitters[i].y = read_i32(f);
+        emitters[i].rate = read_i32(f); emitters[i].pattern = read_i32(f);
+    }
+    for (int i = 0; i < n_absorbers; i++) {
+        absorbers[i].x = read_i32(f); absorbers[i].y = read_i32(f);
+        absorbers[i].radius = read_i32(f);
+    }
+
+    fclose(f);
+
+    current_ruleset = find_matching_ruleset();
+    if (current_ruleset < 0) current_ruleset = 0;
+    timeline_clear();
+    timeline_push();
+    hist_count = 0;
+    hist_pos = 0;
+    hist_push(population);
+    replay_mode = 0;
+
+    char msg[80];
+    snprintf(msg, sizeof(msg), "Loaded %s", path);
+    flash_set(msg);
+}
+
 /* ── Zone colors & painting ────────────────────────────────────────────────── */
 
 /* Distinct hue per zone (used for subtle background tinting) */
@@ -1313,6 +1489,11 @@ static void render(int running, int speed_ms, int draw_mode) {
                  state, wrap_str, draw_str, heat_str, sym_str, zoom_str, map_str, zone_str,
                  emit_str, rule_display, generation, population, speed_ms);
 
+    /* Flash message (save/load feedback) */
+    if (flash_active()) {
+        p += sprintf(p, "  \033[97;42m %s \033[0m", flash_msg);
+    }
+
     /* sparkline right after stats */
     if (show_graph && hist_count > 1) {
         p += sprintf(p, "  ");
@@ -1330,7 +1511,8 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
-                     "[/]rule [m]mut [j]zone [e]emit [z/x]zoom [n]map [<>]time [t]tbar [q]quit\033[0m\033[K\n");
+                     "[/]rule [m]mut [j]zone [e]emit [z/x]zoom [n]map [<>]time [t]tbar "
+                     "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
     if (usable_rows < 5) usable_rows = 5;
@@ -1627,6 +1809,12 @@ int main(void) {
         }
         else if (key == 't' || key == 'T')
             show_timeline = !show_timeline;
+        else if (key == 19) /* Ctrl-S: save */
+            save_state();
+        else if (key == 15) { /* Ctrl-O: load */
+            load_state(0); /* load most recent */
+            printf("\033[2J"); fflush(stdout);
+        }
         else if (key == 'r' || key == 'R') {
             grid_randomize(0.25);
             timeline_push(); /* save initial state */
