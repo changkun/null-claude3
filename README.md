@@ -52,6 +52,7 @@ Requires only `gcc` and a POSIX terminal.
 | `[` / `]` | Cycle stamp pattern (in stamp mode) |
 | Scroll wheel | Rotate stamp 0°/90°/180°/270° (in stamp mode) |
 | `C` | Toggle Wolfram class detector (auto-classify I/II/III/IV) |
+| `O` | Toggle information flow field (transfer entropy causal vectors) |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
 | `1`–`5` (in overlay) | Load a discovered rule into the simulation |
@@ -360,6 +361,26 @@ grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmet
 - Auto-numbered slots (up to 999) prevent accidental overwrites
 - Status bar flashes green confirmation on save/load
 - Enables sharing interesting configurations and resuming experiments
+
+## Information Flow Field
+
+Toggle with `O`. Computes **transfer entropy** between each cell and its cardinal
+neighbors over a sliding temporal window, producing a **directional causal influence
+vector field** that reveals how information propagates through the automaton.
+
+**What it shows:**
+- **Arrow glyphs** at block centers (every 4 cells) showing net information flow direction
+- **Color-coded by direction** (HSV hue = angle) and **brightness by magnitude**
+- **Overlay panel** with global mean flow, max magnitude, vorticity (curl), source/sink counts
+- **Direction histogram** showing dominant flow direction across the grid
+
+**Key concepts:**
+- **Transfer entropy** TE(X→Y) measures how much knowing X's past reduces uncertainty about Y's future, beyond what Y's own past already tells us. This captures *directional causal influence*.
+- **Sources** are regions that export information (high outward TE) — often glider launchers or emitters
+- **Sinks** are regions that absorb information (high inward TE) — often absorbers or colliders
+- **Vorticity** measures rotational flow patterns — swirling information currents
+
+Unlike other analyzers that measure *properties* (entropy, dimension, sensitivity), the flow field measures *directed relationships* — showing that cell A is causing changes in cell B but not vice versa.
 
 ## Implementation Details
 

@@ -52,6 +52,7 @@
  *   u           Toggle 2D Fourier spectrum analyzer (spatial frequency analysis)
  *   F           Toggle box-counting fractal dimension analyzer
  *   C           Toggle Wolfram class detector (auto-classify I/II/III/IV)
+ *   O           Toggle information flow field (transfer entropy causal vectors)
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -198,6 +199,29 @@ static float wf_pop_var = 0.0f;     /* population variance (normalized) */
 static float wf_pop_trend = 0.0f;   /* population trend (growth/decay rate) */
 static float wf_density = 0.0f;     /* live cell density */
 static float wf_pop_acf = 0.0f;     /* population autocorrelation (periodicity) */
+
+/* ── Information Flow Field ────────────────────────────────────────────────── */
+/* Transfer entropy-based directional causal influence vectors.
+   Computes pairwise transfer entropy between each cell and its 4 cardinal
+   neighbors over a sliding temporal window.  Derives a net information flow
+   vector (direction + magnitude) per cell, revealing glider highways,
+   information barriers, and computational channels. */
+#define FLOW_WINDOW 16   /* temporal frames for transfer entropy */
+#define FLOW_BLOCK  4    /* spatial block size for coarse-graining */
+
+static float flow_vx[MAX_H][MAX_W];   /* x-component of flow vector */
+static float flow_vy[MAX_H][MAX_W];   /* y-component of flow vector */
+static float flow_mag[MAX_H][MAX_W];  /* magnitude of flow vector */
+static int   flow_mode = 0;           /* 0=off, 1=on */
+static int   flow_stale = 1;          /* 1=needs recomputation */
+static float flow_global_mag = 0.0f;  /* mean flow magnitude */
+static float flow_max_mag = 0.0f;     /* max flow magnitude */
+static float flow_vorticity = 0.0f;   /* mean curl (rotational tendency) */
+static int   flow_n_sources = 0;      /* cells with strong outward divergence */
+static int   flow_n_sinks = 0;        /* cells with strong inward convergence */
+/* Direction histogram: 8 bins for N,NE,E,SE,S,SW,W,NW */
+static int   flow_dir_hist[8];
+static int   flow_dir_hist_max = 1;
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1073,6 +1097,7 @@ static void grid_step(void) {
     fourier_stale = 1;
     fractal_stale = 1;
     wolfram_stale = 1;
+    flow_stale = 1;
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -3083,6 +3108,282 @@ static void wolfram_classify(void) {
     wolfram_stale = 0;
 }
 
+/* ── Information Flow Field computation ───────────────────────────────────── */
+
+/* Compute transfer entropy from cell (sx,sy) to cell (tx,ty) over temporal window.
+   TE(X→Y) = Σ p(y_{t+1}, y_t, x_t) * log2( p(y_{t+1}|y_t,x_t) / p(y_{t+1}|y_t) )
+   Using binary states: count joint occurrences in the temporal buffer. */
+static float transfer_entropy_pair(int sx, int sy, int tx, int ty, int depth) {
+    if (!timeline || depth < 4) return 0.0f;
+
+    /* Count joint state occurrences: (y_{t+1}, y_t, x_t) — 2×2×2 = 8 bins */
+    int counts[2][2][2]; /* [y_next][y_cur][x_cur] */
+    memset(counts, 0, sizeof(counts));
+    int total = 0;
+
+    for (int i = 0; i < depth - 1; i++) {
+        TimelineFrame *f_cur = timeline_get(i + 1); /* older */
+        TimelineFrame *f_nxt = timeline_get(i);      /* newer */
+        if (!f_cur || !f_nxt) continue;
+
+        int x_cur = (f_cur->grid[sy][sx] > 0) ? 1 : 0;
+        int y_cur = (f_cur->grid[ty][tx] > 0) ? 1 : 0;
+        int y_nxt = (f_nxt->grid[ty][tx] > 0) ? 1 : 0;
+
+        counts[y_nxt][y_cur][x_cur]++;
+        total++;
+    }
+
+    if (total < 3) return 0.0f;
+
+    /* Compute TE = Σ p(y',y,x) * log2( p(y'|y,x) / p(y'|y) ) */
+    double te = 0.0;
+    double inv_total = 1.0 / (double)total;
+
+    for (int yn = 0; yn < 2; yn++) {
+        for (int yc = 0; yc < 2; yc++) {
+            /* p(y'|y) marginal */
+            int n_yc = 0;
+            int n_yn_yc = 0;
+            for (int xc = 0; xc < 2; xc++) {
+                n_yc += counts[0][yc][xc] + counts[1][yc][xc];
+                n_yn_yc += counts[yn][yc][xc];
+            }
+            if (n_yc == 0 || n_yn_yc == 0) continue;
+            double p_yn_given_yc = (double)n_yn_yc / (double)n_yc;
+
+            for (int xc = 0; xc < 2; xc++) {
+                int n_joint = counts[yn][yc][xc];
+                if (n_joint == 0) continue;
+
+                /* p(y'|y,x) conditional */
+                int n_yc_xc = counts[0][yc][xc] + counts[1][yc][xc];
+                if (n_yc_xc == 0) continue;
+                double p_yn_given_yc_xc = (double)n_joint / (double)n_yc_xc;
+
+                /* p(y',y,x) */
+                double p_joint = (double)n_joint * inv_total;
+
+                if (p_yn_given_yc > 0.0 && p_yn_given_yc_xc > 0.0) {
+                    te += p_joint * log(p_yn_given_yc_xc / p_yn_given_yc);
+                }
+            }
+        }
+    }
+
+    /* Convert to bits (log2) */
+    te *= 1.4426950408889634; /* 1/ln(2) */
+    if (te < 0.0) te = 0.0;  /* numerical noise */
+    return (float)te;
+}
+
+static void flow_compute(void) {
+    int n = tl_len;
+    int depth = n < FLOW_WINDOW ? n : FLOW_WINDOW;
+
+    if (depth < 4) {
+        memset(flow_vx, 0, sizeof(flow_vx));
+        memset(flow_vy, 0, sizeof(flow_vy));
+        memset(flow_mag, 0, sizeof(flow_mag));
+        flow_global_mag = 0.0f;
+        flow_max_mag = 0.0f;
+        flow_vorticity = 0.0f;
+        flow_n_sources = 0;
+        flow_n_sinks = 0;
+        memset(flow_dir_hist, 0, sizeof(flow_dir_hist));
+        flow_dir_hist_max = 1;
+        flow_stale = 0;
+        return;
+    }
+
+    /* Compute per-block transfer entropy in 4 cardinal directions.
+       Use coarse blocks (FLOW_BLOCK×FLOW_BLOCK) for performance. */
+    int bw = (W + FLOW_BLOCK - 1) / FLOW_BLOCK;
+    int bh = (H + FLOW_BLOCK - 1) / FLOW_BLOCK;
+
+    /* Temporary block-level flow vectors */
+    float bvx[50][100]; /* max 200/4=50, 400/4=100 */
+    float bvy[50][100];
+    memset(bvx, 0, sizeof(bvx));
+    memset(bvy, 0, sizeof(bvy));
+
+    double sum_mag = 0.0;
+    float max_m = 0.0f;
+    double sum_curl = 0.0;
+    int n_blocks = 0;
+    int sources = 0, sinks = 0;
+    memset(flow_dir_hist, 0, sizeof(flow_dir_hist));
+
+    for (int by = 0; by < bh && by < 50; by++) {
+        for (int bx = 0; bx < bw && bx < 100; bx++) {
+            /* Representative cell: center of block */
+            int cx = bx * FLOW_BLOCK + FLOW_BLOCK / 2;
+            int cy = by * FLOW_BLOCK + FLOW_BLOCK / 2;
+            if (cx >= W) cx = W - 1;
+            if (cy >= H) cy = H - 1;
+
+            /* Compute TE from each cardinal neighbor TO this cell
+               (how much does neighbor predict this cell's future?) */
+            float te_from_east = 0.0f, te_from_west = 0.0f;
+            float te_from_south = 0.0f, te_from_north = 0.0f;
+            float te_to_east = 0.0f, te_to_west = 0.0f;
+            float te_to_south = 0.0f, te_to_north = 0.0f;
+
+            int nx, ny;
+
+            /* East neighbor */
+            nx = cx + FLOW_BLOCK; ny = cy;
+            if (nx < W) {
+                te_from_east = transfer_entropy_pair(nx, ny, cx, cy, depth);
+                te_to_east = transfer_entropy_pair(cx, cy, nx, ny, depth);
+            }
+            /* West neighbor */
+            nx = cx - FLOW_BLOCK; ny = cy;
+            if (nx >= 0) {
+                te_from_west = transfer_entropy_pair(nx, ny, cx, cy, depth);
+                te_to_west = transfer_entropy_pair(cx, cy, nx, ny, depth);
+            }
+            /* South neighbor */
+            nx = cx; ny = cy + FLOW_BLOCK;
+            if (ny < H) {
+                te_from_south = transfer_entropy_pair(nx, ny, cx, cy, depth);
+                te_to_south = transfer_entropy_pair(cx, cy, nx, ny, depth);
+            }
+            /* North neighbor */
+            nx = cx; ny = cy - FLOW_BLOCK;
+            if (ny >= 0) {
+                te_from_north = transfer_entropy_pair(nx, ny, cx, cy, depth);
+                te_to_north = transfer_entropy_pair(cx, cy, nx, ny, depth);
+            }
+
+            /* Net flow: direction of information OUTFLOW from this cell
+               Positive x = information flows rightward (we influence east more than east influences us) */
+            float vx_val = (te_to_east - te_from_east) - (te_to_west - te_from_west);
+            float vy_val = (te_to_south - te_from_south) - (te_to_north - te_from_north);
+
+            bvx[by][bx] = vx_val;
+            bvy[by][bx] = vy_val;
+
+            float m = sqrtf(vx_val * vx_val + vy_val * vy_val);
+            if (m > max_m) max_m = m;
+            sum_mag += m;
+            n_blocks++;
+
+            /* Divergence (source/sink detection) */
+            float div = (te_to_east + te_to_west + te_to_south + te_to_north)
+                      - (te_from_east + te_from_west + te_from_south + te_from_north);
+            if (div > 0.05f) sources++;
+            else if (div < -0.05f) sinks++;
+
+            /* Direction histogram */
+            if (m > 0.005f) {
+                float angle = atan2f(-vy_val, vx_val); /* -vy because screen y is inverted */
+                if (angle < 0) angle += 6.2831853f;
+                int bin = (int)(angle * 8.0f / 6.2831853f) % 8;
+                flow_dir_hist[bin]++;
+            }
+        }
+    }
+
+    /* Compute vorticity (curl of flow field) */
+    int curl_count = 0;
+    for (int by = 1; by < bh - 1 && by < 49; by++) {
+        for (int bx = 1; bx < bw - 1 && bx < 99; bx++) {
+            /* curl = dvx/dy - dvy/dx (finite differences) */
+            float dvx_dy = (bvx[by+1][bx] - bvx[by-1][bx]) * 0.5f;
+            float dvy_dx = (bvy[by][bx+1] - bvy[by][bx-1]) * 0.5f;
+            sum_curl += fabs(dvx_dy - dvy_dx);
+            curl_count++;
+        }
+    }
+
+    /* Spread block values to per-cell grids */
+    for (int y = 0; y < H; y++) {
+        int by = y / FLOW_BLOCK;
+        if (by >= 50) by = 49;
+        for (int x = 0; x < W; x++) {
+            int bx = x / FLOW_BLOCK;
+            if (bx >= 100) bx = 99;
+            flow_vx[y][x] = bvx[by][bx];
+            flow_vy[y][x] = bvy[by][bx];
+            float m = sqrtf(bvx[by][bx] * bvx[by][bx] + bvy[by][bx] * bvy[by][bx]);
+            flow_mag[y][x] = m;
+        }
+    }
+
+    flow_global_mag = n_blocks > 0 ? (float)(sum_mag / n_blocks) : 0.0f;
+    flow_max_mag = max_m;
+    flow_vorticity = curl_count > 0 ? (float)(sum_curl / curl_count) : 0.0f;
+    flow_n_sources = sources;
+    flow_n_sinks = sinks;
+
+    /* Compute direction histogram max */
+    flow_dir_hist_max = 1;
+    for (int i = 0; i < 8; i++)
+        if (flow_dir_hist[i] > flow_dir_hist_max)
+            flow_dir_hist_max = flow_dir_hist[i];
+
+    flow_stale = 0;
+}
+
+/* Map flow magnitude + direction to RGB color and Unicode arrow glyph */
+static RGB flow_to_rgb(float mag, float vx, float vy) {
+    /* Normalize magnitude for color */
+    float norm = flow_max_mag > 0.001f ? mag / flow_max_mag : 0.0f;
+    if (norm > 1.0f) norm = 1.0f;
+
+    /* Color by direction: hue encodes angle, brightness encodes magnitude
+       Use HSV-style mapping where angle → hue, magnitude → value */
+    float angle = atan2f(-vy, vx); /* screen coords: -vy for upward */
+    if (angle < 0) angle += 6.2831853f;
+    float hue = angle / 6.2831853f; /* 0..1 */
+
+    /* 6-sector HSV to RGB */
+    float h6 = hue * 6.0f;
+    int hi = (int)h6 % 6;
+    float f = h6 - (int)h6;
+    float v = 0.3f + 0.7f * norm; /* brightness: 0.3 (dim) to 1.0 (bright) */
+    float s = 0.7f + 0.3f * norm; /* saturation increases with magnitude */
+    float p = v * (1.0f - s);
+    float q = v * (1.0f - s * f);
+    float t = v * (1.0f - s * (1.0f - f));
+
+    float r, g, b;
+    switch (hi) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+
+    return (RGB){
+        (unsigned char)(r * 255),
+        (unsigned char)(g * 255),
+        (unsigned char)(b * 255)
+    };
+}
+
+/* Get Unicode arrow character for flow direction */
+static const char *flow_arrow(float vx, float vy, float mag) {
+    if (mag < 0.001f) return "\xc2\xb7"; /* middle dot for no flow */
+    float angle = atan2f(-vy, vx);
+    if (angle < 0) angle += 6.2831853f;
+    int octant = ((int)(angle * 8.0f / 6.2831853f + 0.5f)) % 8;
+    static const char *arrows[] = {
+        "\xe2\x86\x92", /* → E   */
+        "\xe2\x86\x97", /* ↗ NE  */
+        "\xe2\x86\x91", /* ↑ N   */
+        "\xe2\x86\x96", /* ↖ NW  */
+        "\xe2\x86\x90", /* ← W   */
+        "\xe2\x86\x99", /* ↙ SW  */
+        "\xe2\x86\x93", /* ↓ S   */
+        "\xe2\x86\x98", /* ↘ SE  */
+    };
+    return arrows[octant];
+}
+
 /* ── Save / Load (.life files) ─────────────────────────────────────────────── */
 
 /*
@@ -4419,6 +4720,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Information flow field overlay: directional causal influence */
+    if (flow_mode) {
+        float m = flow_mag[y][x];
+        if (m > 0.001f || grid[y][x]) {
+            *out = flow_to_rgb(m, flow_vx[y][x], flow_vy[y][x]);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 14; /* 14 = flow ghost */
+        }
+        return 0;
+    }
+
     /* Temperature field overlay: show thermal landscape as blue→red wash */
     if (temp_mode) {
         float t = temp_global + temp_grid[y][x];
@@ -4586,6 +4902,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                  class_colors[wc], class_names[wc], wolfram_confidence * 100.0f);
     }
 
+    /* Information flow field indicator */
+    char flow_str[96] = "";
+    if (flow_mode)
+        snprintf(flow_str, sizeof(flow_str),
+                 " \033[38;2;60;220;200m\xe2\x87\x89" "FLOW:%.4f\033[0m", flow_global_mag);
+
     /* Census indicator */
     char census_str[64] = "";
     if (census_mode)
@@ -4712,9 +5034,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -4739,7 +5061,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
-                     "[X]temp [C]class [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[X]temp [C]class [O]flow [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
@@ -4755,7 +5077,15 @@ static void render(int running, int speed_ms, int draw_mode) {
                 RGB c;
                 int t = cell_color(gx, gy, &c);
                 if (t == 1) {
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
+                    /* Show arrow glyphs at block centers in flow mode */
+                    if (flow_mode && (gx % FLOW_BLOCK == FLOW_BLOCK/2) && (gy % FLOW_BLOCK == FLOW_BLOCK/2)) {
+                        float m = flow_mag[gy][gx];
+                        const char *arrow = flow_arrow(flow_vx[gy][gx], flow_vy[gy][gx], m);
+                        p += sprintf(p, "\033[48;2;%d;%d;%dm\033[38;2;255;255;255m%s \033[0m",
+                                     c.r, c.g, c.b, arrow);
+                    } else {
+                        p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
+                    }
                 } else if (t == 2) {
                     p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7 \033[0m", c.r, c.g, c.b);
                 } else if (t == 3) {
@@ -4781,6 +5111,17 @@ static void render(int running, int speed_ms, int draw_mode) {
                 } else if (t == 10) {
                     /* WIP portal entrance (placing) */
                     p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8C \033[0m", c.r/3, c.g/3, c.b/3);
+                } else if (t == 14) {
+                    /* Flow field ghost: show arrow glyph at block centers, colored bg elsewhere */
+                    int in_center = (gx % FLOW_BLOCK == FLOW_BLOCK/2) && (gy % FLOW_BLOCK == FLOW_BLOCK/2);
+                    if (in_center) {
+                        float m = flow_mag[gy][gx];
+                        const char *arrow = flow_arrow(flow_vx[gy][gx], flow_vy[gy][gx], m);
+                        p += sprintf(p, "\033[48;2;%d;%d;%dm\033[38;2;255;255;255m%s \033[0m",
+                                     c.r/2, c.g/2, c.b/2, arrow);
+                    } else {
+                        p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
+                    }
                 } else {
                     *p++ = ' '; *p++ = ' ';
                 }
@@ -6010,6 +6351,139 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", wrst);
     }
 
+    /* ── Information Flow Field overlay panel ─────────────────────────────── */
+    if (flow_mode) {
+        int fl_w = 44;
+        int fl_col = term_cols - fl_w - 2;
+        /* Stack below other active panels */
+        int fl_row = 3;
+        if (entropy_mode) fl_row += 8;
+        if (temp_mode)    fl_row += 9;
+        if (lyapunov_mode) fl_row += 8;
+        if (fourier_mode) fl_row += 18;
+        if (fractal_mode) fl_row += 11;
+        if (wolfram_mode) fl_row += 14;
+        if (fl_col < 1) fl_col = 1;
+
+        const char *flbdr = "\033[38;2;60;220;200;48;2;4;16;14m";
+        const char *flbg  = "\033[48;2;4;16;14m";
+        const char *flrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Info Flow \xe2\x87\x89 ",
+                     fl_row, fl_col, flbdr);
+        for (int i = 14; i < fl_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", flrst);
+
+        /* Row 1: Global mean flow magnitude */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fl_row + 1, fl_col, flbdr, flbg);
+        p += sprintf(p, " \033[38;2;60;220;200mMean mag: \033[1;38;2;120;255;240m%.6f",
+                     flow_global_mag);
+        {
+            int used = 26;
+            for (int i = used; i < fl_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", flbdr, flrst);
+
+        /* Row 2: Max magnitude + vorticity */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fl_row + 2, fl_col, flbdr, flbg);
+        p += sprintf(p, " \033[38;2;60;220;200mMax: \033[38;2;255;220;80m%.5f"
+                     " \033[38;2;60;220;200mCurl: \033[38;2;200;120;255m%.5f",
+                     flow_max_mag, flow_vorticity);
+        {
+            int used = 36;
+            for (int i = used; i < fl_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", flbdr, flrst);
+
+        /* Row 3: Sources and sinks */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fl_row + 3, fl_col, flbdr, flbg);
+        p += sprintf(p, " \033[38;2;255;160;60mSources:%d"
+                     " \033[38;2;60;160;255mSinks:%d"
+                     " \033[38;2;100;100;80mWindow:%d",
+                     flow_n_sources, flow_n_sinks,
+                     tl_len < FLOW_WINDOW ? tl_len : FLOW_WINDOW);
+        {
+            int used = 34;
+            for (int i = used; i < fl_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", flbdr, flrst);
+
+        /* Row 4: Direction histogram label */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fl_row + 4, fl_col, flbdr, flbg);
+        p += sprintf(p, " \033[38;2;60;220;200mDirection: ");
+        {
+            /* Compact direction rose: show 8 directions with bar heights */
+            static const int dir_colors[][3] = {
+                {255,80,80}, {255,180,60}, {255,255,60}, {80,255,80},
+                {60,200,255}, {80,80,255}, {180,60,255}, {255,60,180}
+            };
+            for (int d = 0; d < 8; d++) {
+                int h = flow_dir_hist[d] * 4 / flow_dir_hist_max;
+                if (h > 4) h = 4;
+                p += sprintf(p, "\033[38;2;%d;%d;%dm",
+                             dir_colors[d][0], dir_colors[d][1], dir_colors[d][2]);
+                if (h >= 3) p += sprintf(p, "\xe2\x96\x88"); /* █ */
+                else if (h >= 2) p += sprintf(p, "\xe2\x96\x93"); /* ▓ */
+                else if (h >= 1) p += sprintf(p, "\xe2\x96\x91"); /* ░ */
+                else p += sprintf(p, "\xc2\xb7"); /* · */
+            }
+        }
+        {
+            int used = 30;
+            for (int i = used; i < fl_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", flbdr, flrst);
+
+        /* Row 5: Direction labels */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fl_row + 5, fl_col, flbdr, flbg);
+        p += sprintf(p, " \033[38;2;100;100;80m          E NEN NWW SWS SE");
+        {
+            int used = 37;
+            for (int i = used; i < fl_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", flbdr, flrst);
+
+        /* Row 6: Visual compass rose */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fl_row + 6, fl_col, flbdr, flbg);
+        {
+            /* Show dominant direction as large arrow */
+            int best_dir = 0;
+            for (int d = 1; d < 8; d++)
+                if (flow_dir_hist[d] > flow_dir_hist[best_dir]) best_dir = d;
+            static const char *big_arrows[] = {
+                "\xe2\x87\x92", "\xe2\x87\x97", "\xe2\x87\x91", "\xe2\x87\x96",
+                "\xe2\x87\x90", "\xe2\x87\x99", "\xe2\x87\x93", "\xe2\x87\x98"
+            };
+            static const char *dir_names[] = {"East","NE","North","NW","West","SW","South","SE"};
+            static const int dir_c[][3] = {
+                {255,80,80}, {255,180,60}, {255,255,60}, {80,255,80},
+                {60,200,255}, {80,80,255}, {180,60,255}, {255,60,180}
+            };
+            p += sprintf(p, " \033[1;38;2;%d;%d;%dm Dominant: %s %s ",
+                         dir_c[best_dir][0], dir_c[best_dir][1], dir_c[best_dir][2],
+                         big_arrows[best_dir], dir_names[best_dir]);
+        }
+        {
+            int used = 30;
+            for (int i = used; i < fl_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", flbdr, flrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", fl_row + 7, fl_col, flbdr);
+        for (int i = 0; i < fl_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", flrst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -6483,6 +6957,12 @@ int main(int argc, char **argv) {
                 wolfram_classify(); /* compute on toggle-on */
             }
         }
+        else if (key == 'O') {
+            flow_mode = !flow_mode;
+            if (flow_mode) {
+                flow_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -6893,6 +7373,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh Wolfram classifier every 16 generations (fuses entropy+Lyapunov+fractal+pop) */
         if (wolfram_mode && wolfram_stale && (generation % 16 == 0 || !running)) {
             wolfram_classify();
+        }
+
+        /* Auto-refresh information flow field every 16 generations (transfer entropy over temporal window) */
+        if (flow_mode && flow_stale && (generation % 16 == 0 || !running)) {
+            flow_compute();
         }
 
         render(running, speed_ms, draw_mode);
