@@ -119,6 +119,20 @@ static float temp_global = 0.0f;       /* global uniform temperature offset */
 static float temp_brush = 0.5f;        /* brush temperature for painting */
 static int   temp_brush_radius = 3;    /* brush radius for spatial painting */
 
+/* ── Lyapunov Sensitivity Map ──────────────────────────────────────────── */
+/* Perturbation sensitivity: run a shadow grid with single-cell bit-flips
+   and measure how quickly the perturbation diverges from the real grid.
+   Cells colored by local sensitivity: blue (stable) → yellow (critical) → red (chaotic). */
+static float lyapunov_grid[MAX_H][MAX_W];  /* accumulated sensitivity per cell 0.0–1.0 */
+static int   lyapunov_mode = 0;            /* 0=off, 1=on */
+static int   lyapunov_stale = 1;           /* 1=needs recomputation */
+static float lyapunov_global = 0.0f;       /* mean sensitivity across grid */
+static float lyapunov_max_local = 0.0f;    /* max local sensitivity found */
+
+#define LYAP_HORIZON  16   /* shadow generations per measurement cycle */
+#define LYAP_PERTURB  80   /* 1-in-N cells get bit-flipped in shadow */
+#define LYAP_DECAY    0.82f /* sliding window EMA decay factor */
+
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
 static int census_stale = 1;   /* 1=needs recomputation */
@@ -989,6 +1003,7 @@ static void grid_step(void) {
     freq_stale = 1;
     census_stale = 1;
     entropy_stale = 1;
+    lyapunov_stale = 1;
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -2227,6 +2242,123 @@ static RGB temp_to_rgb(float t) {
             (unsigned char)(255),
             (unsigned char)(255 - f * 215),
             (unsigned char)(255 - f * 235)
+        };
+    }
+}
+
+/* ── Lyapunov Sensitivity computation ──────────────────────────────────────── */
+
+/* Lightweight grid stepper: deterministic rules only (no ghosts, tracers,
+   emitters, ecosystem, or temperature noise).  Used for shadow/reference
+   forward simulation in Lyapunov measurement. */
+static void grid_step_bare(unsigned char src[MAX_H][MAX_W],
+                           unsigned char dst[MAX_H][MAX_W]) {
+    memset(dst, 0, MAX_H * MAX_W);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int n = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx2 = x + dx, ny2 = y + dy;
+                    if (!topo_map(&nx2, &ny2)) continue;
+                    if (src[ny2][nx2] > 0) n++;
+                }
+            unsigned short b_mask = birth_mask;
+            unsigned short s_mask = survival_mask;
+            if (zone_enabled) {
+                int zi = zone[y][x];
+                if (zi < N_RULESETS) {
+                    b_mask = rulesets[zi].birth;
+                    s_mask = rulesets[zi].survival;
+                }
+            }
+            int outcome = (src[y][x] > 0 && (s_mask & (1 << n))) ||
+                          (src[y][x] == 0 && (b_mask & (1 << n)));
+            if (outcome) {
+                int age = src[y][x];
+                dst[y][x] = (unsigned char)((age < 255) ? age + 1 : 255);
+            }
+        }
+    }
+}
+
+/* Run shadow perturbation experiment and accumulate sensitivity.
+   1. Copy grid → reference and shadow
+   2. Inject random single-cell bit-flips into shadow
+   3. Step both forward LYAP_HORIZON generations (deterministic)
+   4. Measure local Hamming distance per cell (5×5 neighborhood)
+   5. Blend into lyapunov_grid via exponential moving average */
+static void lyapunov_compute(void) {
+    static unsigned char ref[MAX_H][MAX_W];
+    static unsigned char ref_next[MAX_H][MAX_W];
+    static unsigned char shd[MAX_H][MAX_W];
+    static unsigned char shd_next[MAX_H][MAX_W];
+
+    /* Snapshot current grid into both reference and shadow */
+    memcpy(ref, grid, sizeof(grid));
+    memcpy(shd, grid, sizeof(grid));
+
+    /* Inject perturbations: flip ~1/LYAP_PERTURB of cells in shadow */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (rand() % LYAP_PERTURB == 0)
+                shd[y][x] = shd[y][x] ? 0 : 1;
+
+    /* Run both grids forward LYAP_HORIZON steps */
+    for (int s = 0; s < LYAP_HORIZON; s++) {
+        grid_step_bare(ref, ref_next);
+        grid_step_bare(shd, shd_next);
+        memcpy(ref, ref_next, MAX_H * MAX_W);
+        memcpy(shd, shd_next, MAX_H * MAX_W);
+    }
+
+    /* Accumulate local Hamming distance into lyapunov_grid (EMA) */
+    double sum = 0.0;
+    float mx = 0.0f;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int diff = 0, total = 0;
+            for (int dy = -2; dy <= 2; dy++)
+                for (int dx = -2; dx <= 2; dx++) {
+                    int nx2 = x + dx, ny2 = y + dy;
+                    if (!topo_map(&nx2, &ny2)) continue;
+                    total++;
+                    if ((ref[ny2][nx2] > 0) != (shd[ny2][nx2] > 0))
+                        diff++;
+                }
+            float sensitivity = total > 0 ? (float)diff / (float)total : 0.0f;
+            lyapunov_grid[y][x] = lyapunov_grid[y][x] * LYAP_DECAY
+                                + sensitivity * (1.0f - LYAP_DECAY);
+            sum += lyapunov_grid[y][x];
+            if (lyapunov_grid[y][x] > mx) mx = lyapunov_grid[y][x];
+        }
+    }
+    lyapunov_global = (float)(sum / (double)(W * H));
+    lyapunov_max_local = mx;
+    lyapunov_stale = 0;
+}
+
+/* Map sensitivity value (0.0–1.0) to RGB:
+   blue (stable) → yellow (critical) → red (chaotic/sensitive) */
+static RGB lyapunov_to_rgb(float s) {
+    if (s <= 0.0f) return (RGB){10, 12, 60};        /* deep blue (stable) */
+    if (s >= 1.0f) return (RGB){255, 30, 15};        /* hot red (chaotic) */
+    if (s < 0.5f) {
+        /* Blue → yellow (0.0 → 0.5) */
+        float t = s * 2.0f;
+        return (RGB){
+            (unsigned char)(10 + t * 245),
+            (unsigned char)(12 + t * 228),
+            (unsigned char)(60 - t * 50)
+        };
+    } else {
+        /* Yellow → red (0.5 → 1.0) */
+        float t = (s - 0.5f) * 2.0f;
+        return (RGB){
+            255,
+            (unsigned char)(240 - t * 210),
+            (unsigned char)(10)
         };
     }
 }
@@ -3518,6 +3650,25 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Lyapunov sensitivity overlay: perturbation divergence map */
+    if (lyapunov_mode) {
+        float raw = lyapunov_grid[y][x];
+        /* Scale: multiply by 3 so moderate sensitivity fills the color range */
+        float s = raw * 3.0f;
+        if (s > 1.0f) s = 1.0f;
+        if (s > 0.005f || grid[y][x]) {
+            *out = lyapunov_to_rgb(s);
+            if (grid[y][x]) {
+                /* Brighten alive cells for structure visibility */
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 11; /* 11 = lyapunov ghost */
+        }
+        return 0;
+    }
+
     /* Temperature field overlay: show thermal landscape as blue→red wash */
     if (temp_mode) {
         float t = temp_global + temp_grid[y][x];
@@ -3655,6 +3806,12 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(entropy_str, sizeof(entropy_str),
                  " \033[38;2;180;255;180m\u2234ENT:%.3f\033[0m", entropy_global);
 
+    /* Lyapunov sensitivity indicator */
+    char lyapunov_str[96] = "";
+    if (lyapunov_mode)
+        snprintf(lyapunov_str, sizeof(lyapunov_str),
+                 " \033[38;2;220;200;60m\xce\xbbLYAP:%.4f\033[0m", lyapunov_global);
+
     /* Census indicator */
     char census_str[64] = "";
     if (census_mode)
@@ -3781,9 +3938,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -3807,7 +3964,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent "
+                     "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap "
                      "[X]temp [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
@@ -4510,6 +4667,94 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", trst);
     }
 
+    /* ── Lyapunov Sensitivity overlay panel ───────────────────────────────── */
+    if (lyapunov_mode) {
+        int lp_w = 44;
+        int lp_col = term_cols - lp_w - 2;
+        /* Stack below entropy and/or temperature panels if active */
+        int lp_row = 3;
+        if (entropy_mode) lp_row += 8;   /* entropy panel is 8 rows */
+        if (temp_mode)    lp_row += 9;   /* temp panel is 9 rows */
+        if (lp_col < 1) lp_col = 1;
+
+        const char *lbdr = "\033[38;2;220;200;60;48;2;16;14;4m";
+        const char *lbg  = "\033[48;2;16;14;4m";
+        const char *lrst  = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Lyapunov \xce\xbb ",
+                     lp_row, lp_col, lbdr);
+        for (int i = 14; i < lp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", lrst);
+
+        /* Stats row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     lp_row + 1, lp_col, lbdr, lbg);
+        p += sprintf(p, " \033[38;2;220;200;60m\xce\xbb\xcc\x84=\033[38;2;255;255;255m%.5f"
+                     "  \033[38;2;220;200;60m\xce\xbb\xe2\x82\x98\xe2\x82\x90\xe2\x82\x93=\033[38;2;255;255;255m%.5f",
+                     lyapunov_global, lyapunov_max_local);
+        p += sprintf(p, "%s", lbg);
+        for (int i = 0; i < 4; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", lbdr, lrst);
+
+        /* Label row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     lp_row + 2, lp_col, lbdr, lbg);
+        p += sprintf(p, " \033[38;2;40;50;120mStable");
+        for (int i = 0; i < 18; i++) *p++ = ' ';
+        p += sprintf(p, "\033[38;2;120;100;40mSensitivity");
+        for (int i = 0; i < 3; i++) *p++ = ' ';
+        p += sprintf(p, "\033[38;2;180;40;20mChaotic ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", lbdr, lrst);
+
+        /* Distribution histogram: bin sensitivity into 10 buckets */
+        int lbins[10] = {0};
+        for (int ly = 0; ly < H; ly++)
+            for (int lx = 0; lx < W; lx++) {
+                float sv = lyapunov_grid[ly][lx] * 3.0f;
+                if (sv > 1.0f) sv = 1.0f;
+                int b = (int)(sv * 9.99f);
+                if (b < 0) b = 0;
+                if (b > 9) b = 9;
+                lbins[b]++;
+            }
+        int lbmax = 1;
+        for (int i = 0; i < 10; i++)
+            if (lbins[i] > lbmax) lbmax = lbins[i];
+
+        /* 4 rows of histogram bars */
+        for (int row = 0; row < 4; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                         lp_row + 3 + row, lp_col, lbdr, lbg);
+            int level = 3 - row;
+            for (int b = 0; b < 10; b++) {
+                int bar_h = lbins[b] * 4 / lbmax;
+                for (int c = 0; c < 4; c++) {
+                    if (bar_h > level) {
+                        RGB bc = lyapunov_to_rgb((float)b / 9.0f);
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88",
+                                     bc.r, bc.g, bc.b);
+                    } else if (bar_h == level) {
+                        RGB bc = lyapunov_to_rgb((float)b / 9.0f);
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84",
+                                     bc.r/2, bc.g/2, bc.b/2);
+                    } else {
+                        p += sprintf(p, "\033[38;2;20;18;8m\xc2\xb7");
+                    }
+                }
+            }
+            *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", lbdr, lrst);
+        }
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", lp_row + 7, lp_col, lbdr);
+        for (int i = 0; i < lp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", lrst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -4959,6 +5204,12 @@ int main(int argc, char **argv) {
                 entropy_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == 'L' || key == 'l') {
+            lyapunov_mode = !lyapunov_mode;
+            if (lyapunov_mode) {
+                lyapunov_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -5349,6 +5600,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh census every 16 generations when active (heavier scan) */
         if (census_mode && census_stale && (generation % 16 == 0 || !running)) {
             census_scan();
+        }
+
+        /* Auto-refresh Lyapunov sensitivity every 16 generations (heavy: 2× shadow simulation) */
+        if (lyapunov_mode && lyapunov_stale && (generation % 16 == 0 || !running)) {
+            lyapunov_compute();
         }
 
         render(running, speed_ms, draw_mode);
