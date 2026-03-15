@@ -30,6 +30,7 @@
  *   f           Toggle frequency analysis overlay (period detection heatmap)
  *   W           Toggle wormhole portal placement (left=entrance, right=exit, middle=remove)
  *                 Paired portals create non-local neighbor coupling
+ *   v           Toggle pattern census overlay (counts known structures)
  *   S           Toggle stamp mode (place classic patterns from library)
  *                 [/] cycle pattern, scroll wheel rotates 0°/90°/180°/270°
  *                 Left-click places pattern, right-click cancels stamp mode
@@ -87,6 +88,59 @@ static int tracer_mode = 0; /* 0=off, 1=accumulating, 2=frozen (visible but not 
 static unsigned char freq_grid[MAX_H][MAX_W]; /* 0=dead, 1=still life, 2-32=period, 255=chaotic */
 static int freq_mode = 0; /* 0=off, 1=on (analysis overlay active) */
 static int freq_stale = 1; /* 1=needs recomputation */
+
+/* ── Pattern Census ───────────────────────────────────────────────────────── */
+static int census_mode = 0;    /* 0=off, 1=on */
+static int census_stale = 1;   /* 1=needs recomputation */
+
+/* Census pattern templates: bitmask-based matching for small patterns.
+   Each pattern is stored as a WxH bitmask grid (max 6x6).
+   The grid must match EXACTLY — live cells where mask=1, dead where mask=0
+   within the bounding box, PLUS a 1-cell dead border around it. */
+#define CENSUS_MAX_PAT 14
+#define CENSUS_PAT_MAX_W 6
+#define CENSUS_PAT_MAX_H 6
+
+typedef struct {
+    const char *name;
+    int w, h;
+    unsigned char bits[CENSUS_PAT_MAX_H][CENSUS_PAT_MAX_W]; /* 1=alive, 0=dead */
+} CensusPattern;
+
+static const CensusPattern census_patterns[CENSUS_MAX_PAT] = {
+    /* ── Still lifes ── */
+    { "Block",    2, 2, {{1,1},{1,1}} },
+    { "Beehive",  4, 3, {{0,1,1,0},{1,0,0,1},{0,1,1,0}} },
+    { "Loaf",     4, 4, {{0,1,1,0},{1,0,0,1},{0,1,0,1},{0,0,1,0}} },
+    { "Boat",     3, 3, {{1,1,0},{1,0,1},{0,1,0}} },
+    { "Tub",      3, 3, {{0,1,0},{1,0,1},{0,1,0}} },
+    { "Pond",     4, 4, {{0,1,1,0},{1,0,0,1},{1,0,0,1},{0,1,1,0}} },
+    { "Ship",     3, 3, {{1,1,0},{1,0,1},{0,1,1}} },
+    { "Barge",    4, 4, {{0,1,0,0},{1,0,1,0},{0,1,0,1},{0,0,1,0}} },
+    /* ── Oscillators (phase 1 only — we match either phase) ── */
+    { "Blinker",  3, 1, {{1,1,1}} },
+    { "Blinker",  1, 3, {{1},{1},{1}} },  /* vertical phase */
+    { "Toad",     4, 2, {{0,1,1,1},{1,1,1,0}} },
+    { "Toad",     2, 4, {{1,0},{1,1},{1,1},{0,1}} },  /* vertical phase */
+    { "Beacon",   4, 4, {{1,1,0,0},{1,0,0,0},{0,0,0,1},{0,0,1,1}} },
+    { "Clock",    4, 4, {{0,0,1,0},{1,0,1,0},{0,1,0,1},{0,1,0,0}} },
+};
+
+/* Census results */
+static int census_counts[CENSUS_MAX_PAT]; /* raw counts per pattern template */
+
+/* Deduplicated counts for display (merge both phases of same oscillator) */
+#define CENSUS_DISPLAY_MAX 10
+static struct { const char *name; int count; } census_display[CENSUS_DISPLAY_MAX];
+static int census_n_display = 0;
+static int census_total = 0; /* total identified structures */
+static int census_unmatched = 0; /* live cells not part of any recognized pattern */
+
+/* Temporary grid to mark already-claimed cells during census scan */
+static unsigned char census_claimed[MAX_H][MAX_W];
+
+/* Forward declaration — defined after grid_step where H/W/wrap_mode are available */
+static void census_scan(void);
 
 static int W = MAX_W, H = MAX_H; /* simulation always uses full grid */
 static int generation;
@@ -712,6 +766,101 @@ static void grid_step(void) {
     hist_push(population);
     timeline_push();
     freq_stale = 1;
+    census_stale = 1;
+}
+
+/* ── Census scan implementation ───────────────────────────────────────────── */
+static void census_scan(void) {
+    memset(census_counts, 0, sizeof(census_counts));
+    memset(census_claimed, 0, sizeof(census_claimed));
+
+    /* For each pattern, scan all possible positions */
+    for (int pi = 0; pi < CENSUS_MAX_PAT; pi++) {
+        const CensusPattern *pat = &census_patterns[pi];
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int match = 1;
+
+                /* Skip if any pattern cell already claimed */
+                for (int py = 0; py < pat->h && match; py++)
+                    for (int px = 0; px < pat->w && match; px++)
+                        if (pat->bits[py][px] && census_claimed[(y+py) % H][(x+px) % W])
+                            match = 0;
+                if (!match) continue;
+
+                /* Check pattern interior: exact alive/dead match */
+                for (int py = 0; py < pat->h && match; py++) {
+                    for (int px = 0; px < pat->w && match; px++) {
+                        int gy = (y + py) % H;
+                        int gx = (x + px) % W;
+                        int alive = (grid[gy][gx] > 0) ? 1 : 0;
+                        if (alive != pat->bits[py][px])
+                            match = 0;
+                    }
+                }
+                if (!match) continue;
+
+                /* Check 1-cell dead border (top/bottom rows) */
+                for (int px = -1; px <= pat->w && match; px++) {
+                    int gx2 = (x + px + W) % W;
+                    int gy_top = (y - 1 + H) % H;
+                    int gy_bot = (y + pat->h) % H;
+                    if (wrap_mode || y > 0)
+                        if (grid[gy_top][gx2]) match = 0;
+                    if (wrap_mode || y + pat->h < H)
+                        if (grid[gy_bot][gx2]) match = 0;
+                }
+                /* Check left/right border columns */
+                for (int py = 0; py < pat->h && match; py++) {
+                    int gy2 = (y + py) % H;
+                    int gx_left = (x - 1 + W) % W;
+                    int gx_right = (x + pat->w) % W;
+                    if (wrap_mode || x > 0)
+                        if (grid[gy2][gx_left]) match = 0;
+                    if (wrap_mode || x + pat->w < W)
+                        if (grid[gy2][gx_right]) match = 0;
+                }
+                if (!match) continue;
+
+                /* Pattern matched — claim cells and count */
+                census_counts[pi]++;
+                for (int py = 0; py < pat->h; py++)
+                    for (int px = 0; px < pat->w; px++)
+                        if (pat->bits[py][px])
+                            census_claimed[(y+py) % H][(x+px) % W] = 1;
+            }
+        }
+    }
+
+    /* Build display: merge patterns with same name (e.g. both blinker phases) */
+    census_n_display = 0;
+    census_total = 0;
+    for (int pi = 0; pi < CENSUS_MAX_PAT; pi++) {
+        if (census_counts[pi] == 0) continue;
+        int found = -1;
+        for (int d = 0; d < census_n_display; d++) {
+            if (strcmp(census_display[d].name, census_patterns[pi].name) == 0) {
+                found = d; break;
+            }
+        }
+        if (found >= 0) {
+            census_display[found].count += census_counts[pi];
+        } else if (census_n_display < CENSUS_DISPLAY_MAX) {
+            census_display[census_n_display].name = census_patterns[pi].name;
+            census_display[census_n_display].count = census_counts[pi];
+            census_n_display++;
+        }
+        census_total += census_counts[pi];
+    }
+
+    /* Count unclaimed live cells */
+    census_unmatched = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x] && !census_claimed[y][x])
+                census_unmatched++;
+
+    census_stale = 0;
 }
 
 static void grid_set(int x, int y) {
@@ -2413,6 +2562,12 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(freq_str, sizeof(freq_str),
                  " \033[38;2;80;180;240m\u2261FREQ\033[0m");
 
+    /* Census indicator */
+    char census_str[64] = "";
+    if (census_mode)
+        snprintf(census_str, sizeof(census_str),
+                 " \033[38;2;100;220;160m\u2630CENSUS\033[0m");
+
     /* Zoom indicator */
     char zoom_str[32] = "";
     if (zoom > 1)
@@ -2503,9 +2658,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, tracer_str, freq_str, sym_str, zoom_str, map_str, zone_str,
+                 state, wrap_str, draw_str, heat_str, tracer_str, freq_str, census_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -2531,7 +2686,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace [f]freq "
                      "[/]rule [m]mut [b]edit [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
-                     "[S]stamp [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
+                     "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
@@ -2833,6 +2988,63 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rst);
     }
 
+    /* Census overlay (top-left, below status bars) */
+    if (census_mode) {
+        int usable = term_rows - 3;
+        int cen_h = census_n_display + 3; /* top border + entries + unmatched + bottom border */
+        int cen_w = 24;
+        int cen_col = 2;
+        int cen_row = 3; /* just below status bars */
+        if (cen_row + cen_h > 3 + usable) cen_h = 3 + usable - cen_row;
+
+        const char *bdr = "\033[38;2;100;220;160;48;2;10;18;12m";
+        const char *bg = "\033[48;2;10;18;12m";
+        const char *rst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Census (%d) ",
+                     cen_row, cen_col, bdr, census_total);
+        int title_len = 13;
+        { int t = census_total; if (t >= 10) title_len++; if (t >= 100) title_len++; if (t >= 1000) title_len++; }
+        for (int i = title_len; i < cen_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rst);
+
+        /* Pattern entries */
+        int row_i = 1;
+        for (int d = 0; d < census_n_display && row_i < cen_h - 1; d++, row_i++) {
+            /* Color based on pattern type: still lifes green, oscillators amber */
+            int is_osc = (strcmp(census_display[d].name, "Blinker") == 0 ||
+                          strcmp(census_display[d].name, "Toad") == 0 ||
+                          strcmp(census_display[d].name, "Beacon") == 0 ||
+                          strcmp(census_display[d].name, "Clock") == 0);
+            const char *clr = is_osc ? "\033[38;2;255;200;80m" : "\033[38;2;80;255;160m";
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s %s%-10s\033[38;2;200;200;200m %3d%s",
+                         cen_row + row_i, cen_col, bdr, bg,
+                         clr, census_display[d].name, census_display[d].count, bg);
+            /* Pad to width */
+            int entry_len = 16; /* " name(10) count(4)" */
+            for (int i = entry_len; i < cen_w - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst);
+        }
+
+        /* Unmatched cells row */
+        if (row_i < cen_h - 1) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s \033[38;2;120;120;120m\xe2\x80\xa6other   %4d%s",
+                         cen_row + row_i, cen_col, bdr, bg, census_unmatched, bg);
+            int entry_len = 16;
+            for (int i = entry_len; i < cen_w - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst);
+            row_i++;
+        }
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", cen_row + row_i, cen_col, bdr);
+        for (int i = 0; i < cen_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rst);
+    }
+
     *p = '\0';
 
     (void)!write(STDOUT_FILENO, render_buf, p - render_buf);
@@ -3083,6 +3295,13 @@ int main(void) {
         }
         else if (key == 'b' || key == 'B') {
             rule_editor = !rule_editor;
+        }
+        else if (key == 'v' || key == 'V') {
+            census_mode = !census_mode;
+            if (census_mode) {
+                census_stale = 1;
+                census_scan();
+            }
         }
         else if (key == 'k' || key == 'K')
             symmetry = (symmetry + 1) % 4;
@@ -3340,6 +3559,11 @@ int main(void) {
         /* Auto-refresh frequency analysis every 8 generations when active */
         if (freq_mode && freq_stale && (generation % 8 == 0 || !running)) {
             freq_analyze();
+        }
+
+        /* Auto-refresh census every 16 generations when active (heavier scan) */
+        if (census_mode && census_stale && (generation % 16 == 0 || !running)) {
+            census_scan();
         }
 
         render(running, speed_ms, draw_mode);
