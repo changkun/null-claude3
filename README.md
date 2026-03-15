@@ -55,6 +55,7 @@ Requires only `gcc` and a POSIX terminal.
 | `O` | Toggle information flow field (transfer entropy causal vectors) |
 | `A` | Toggle phase-space attractor (Takens delay embedding portrait) |
 | `9` | Toggle causal light cone — click cell to trace backward/forward cones |
+| `!` | Toggle prediction surprise field (per-cell transition surprisal heatmap) |
 | `+`/`-` (in cone) | Adjust forward cone depth |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
@@ -401,6 +402,23 @@ Toggle with `A`. Reconstructs the system's **dynamical attractor** from the popu
 - **Space-filling cloud** → strange attractor / chaotic dynamics (positive Lyapunov, fractal D₂)
 
 The HUD panel shows embedding parameters (d, τ), trajectory length, correlation dimension D₂ with automatic classification, population range, and canvas fill percentage.
+
+### Prediction Surprise Field
+
+Toggle with `!`. Accumulates transition statistics over a **32-frame sliding window** — tracking which 9-bit Moore neighborhood configurations lead to which outcomes — then colors each cell by its **information-theoretic surprisal**: -log₂ P(outcome | neighborhood).
+
+- **Dark blue** cells: near-zero surprise — perfectly predictable transitions (still lifes, oscillators)
+- **Cyan → yellow** cells: moderate surprise — partially predictable dynamics
+- **Red / white** cells: high surprise — the leading edge of gliders, phase boundaries, novel configurations
+
+The overlay panel shows mean/max surprisal in bits, plus counts of predictable (< 0.1 bits) vs surprising (> 0.8 bits) cells.
+
+**What it reveals vs other analyzers:**
+- **Entropy** measures spatial disorder (how mixed a neighborhood is right now)
+- **Lyapunov** measures perturbation sensitivity (how a 1-bit flip propagates)
+- **Surprise** measures **temporal unpredictability** — how well the system's own recent history predicts the next state
+
+High-entropy regions aren't necessarily surprising (random noise is high-entropy but predictable *as noise*). Surprise reveals where a specific outcome defied the learned distribution — the true frontier of unpredictability.
 
 ## Implementation Details
 
