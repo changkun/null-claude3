@@ -44,6 +44,9 @@ Requires only `gcc` and a POSIX terminal.
 | `a` | Toggle dual-species ecosystem mode |
 | `6` | Toggle brush species (A ↔ B) in ecosystem mode |
 | `{` / `}` | Adjust cross-species interaction coefficient (-1.0 to +1.0) |
+| `S` | Toggle pattern stamp mode (place classic structures) |
+| `[` / `]` | Cycle stamp pattern (in stamp mode) |
+| Scroll wheel | Rotate stamp 0°/90°/180°/270° (in stamp mode) |
 | `Ctrl-S` | Save state to numbered `.life` file |
 | `Ctrl-O` | Load most recent `.life` save |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |
@@ -258,6 +261,33 @@ Adjust with `{` / `}` in increments of 0.1.
 The minimap shows species A in blue, species B in red, and mixed regions in purple.
 Species data is fully integrated with timeline replay and save/load.
 
+## Pattern Stamp Tool
+
+Press `S` to enter **stamp mode** — a library of 20 classic Game of Life patterns that can be
+rotated and placed at any grid position for precise compositional experimentation.
+
+### Pattern Library
+
+| Category | Patterns |
+|----------|----------|
+| Still lifes | Block, Beehive, Loaf, Boat, Tub |
+| Oscillators | Blinker, Toad, Beacon, Pentadecathlon, Clock |
+| Spaceships | Glider, LWSS, MWSS, HWSS |
+| Methuselahs | R-pentomino, Diehard, Acorn, Pi-heptomino |
+| Other | Gosper Gun, Pulsar |
+
+### Controls
+
+- **`[` / `]`** — cycle through patterns
+- **Scroll wheel** — rotate (0°/90°/180°/270°)
+- **Left-click** — place pattern (respects kaleidoscope symmetry + active species)
+- **Right-click** — exit stamp mode
+
+A gold-bordered **preview overlay** in the bottom-right shows the selected pattern's shape,
+name, and current rotation. Stamps integrate with kaleidoscope symmetry (place mandala-like
+arrangements), ecosystem mode (stamp as active species), and wormhole portals (aim gliders
+at portal entrances).
+
 ## Save & Load
 
 Press `Ctrl-S` to save the full simulation state to a numbered `.life` file (`save_001.life`,
@@ -289,6 +319,7 @@ grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmet
 - Save/load — binary `.life` files preserving full state (grid, zones, emitters, absorbers, settings) with auto-numbered slots and status flash feedback
 - Frequency analysis — per-cell oscillation period detection via autocorrelation over timeline history, with ice-blue→emerald→gold→red color spectrum and legend overlay
 - Wormhole portals — paired non-local spatial couplings with additive neighbor model, animated ring visualization, positional offset mapping, and bidirectional coupling across up to 8 portal pairs
+- Pattern stamp tool — 20 classic patterns across 5 categories with pre-computed rotations, preview overlay, and full integration with symmetry/species/zones
 - Dual-species ecosystem — two coexisting cell populations with independent B/S rules, species-aware neighbor counting, configurable interaction coefficient (-1.0 hostile to +1.0 cooperative), species-specific color gradients, and birth arbitration
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)
