@@ -2,7 +2,7 @@
 
 A fully interactive, zero-dependency cellular automaton explorer that runs in any terminal.
 Written in C with ANSI escape codes for rendering. Supports Conway's Game of Life
-and 9 other Life-like rulesets, plus live rule mutation.
+and 9 other Life-like rulesets, live rule mutation, and kaleidoscope drawing.
 
 ![Terminal simulation](https://upload.wikimedia.org/wikipedia/commons/e/e5/Gospers_glider_gun.gif)
 
@@ -28,6 +28,7 @@ Requires only `gcc` and a POSIX terminal.
 | `h` | Toggle heatmap mode (age coloring + ghost trails) |
 | `[` / `]` | Cycle through rule presets (B/S notation) |
 | `m` | Mutate — randomly flip one birth/survival bit |
+| `k` | Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope) |
 | `1`–`5` | Load preset pattern |
 | `+` / `-` | Speed up / slow down (20ms–1000ms) |
 | `q` / `ESC` | Quit |
@@ -77,4 +78,5 @@ shows `(mutant)` when the active rule doesn't match any preset.
 - SGR extended mouse protocol (1006) for large terminal support
 - Population sparkline using Unicode block elements (▁▂▃▅▇█) with red→yellow→green color gradient
 - Toroidal wrapping mode — gliders and patterns loop around edges
+- Kaleidoscope drawing — 2/4/8-fold symmetric mouse painting with reflections around grid center
 - Proper terminal cleanup on exit (raw mode restore, cursor show)

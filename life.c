@@ -15,6 +15,7 @@
  *   h           Toggle heatmap mode (age coloring + ghost trails)
  *   [ / ]       Cycle through rule presets (B/S notation)
  *   m           Mutate — randomly flip one birth/survival bit
+ *   k           Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope)
  *   q / ESC     Quit
  *
  *   Mouse:      Left-click to place cells, right-click to erase
@@ -52,6 +53,7 @@ static int generation;
 static int population;
 static int wrap_mode = 0; /* toroidal wrapping */
 static int heatmap_mode = 1; /* age heatmap + ghost trails (on by default) */
+static int symmetry = 0; /* 0=none, 1=2-fold, 2=4-fold, 3=8-fold */
 
 /* ── Population history (for sparkline) ────────────────────────────────────── */
 
@@ -218,6 +220,32 @@ static void grid_unset(int x, int y) {
         grid[y][x] = 0;
         ghost[y][x] = GHOST_FRAMES;
         population--;
+    }
+}
+
+/* ── Symmetric drawing ─────────────────────────────────────────────────────── */
+
+static void sym_apply(int gx, int gy, void (*fn)(int, int)) {
+    int cx = W / 2, cy = H / 2;
+    int dx = gx - cx, dy = gy - cy;
+
+    fn(gx, gy); /* always draw the original point */
+
+    if (symmetry >= 1) {
+        /* 2-fold: vertical mirror */
+        fn(cx - dx, gy);
+    }
+    if (symmetry >= 2) {
+        /* 4-fold: + horizontal mirror of both */
+        fn(gx, cy - dy);
+        fn(cx - dx, cy - dy);
+    }
+    if (symmetry >= 3) {
+        /* 8-fold: + diagonal reflections (swap dx,dy) */
+        fn(cx + dy, cy + dx);
+        fn(cx - dy, cy + dx);
+        fn(cx + dy, cy - dx);
+        fn(cx - dy, cy - dx);
     }
 }
 
@@ -556,6 +584,12 @@ static void render(int running, int speed_ms, int draw_mode) {
     const char *heat_str = heatmap_mode
         ? " \033[91m\u2588HEAT\033[0m"
         : "";
+    char sym_str[32] = "";
+    if (symmetry > 0) {
+        static const int folds[] = {0, 2, 4, 8};
+        snprintf(sym_str, sizeof(sym_str),
+                 " \033[93m\u2735SYM:%d\033[0m", folds[symmetry]);
+    }
 
     /* Rule string */
     char rule_str[32];
@@ -569,9 +603,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, rule_display, generation, population, speed_ms);
+                 state, wrap_str, draw_str, heat_str, sym_str, rule_display, generation, population, speed_ms);
 
     /* sparkline right after stats */
     if (show_graph && hist_count > 1) {
@@ -583,7 +617,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [g]graph [w]wrap [h]heat "
+                     "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
                      "[\033[0m\033[90m[/]]rule [m]mutate [+/-]spd [q]quit\033[0m\033[K\n");
 
     if (heatmap_mode) {
@@ -749,6 +783,8 @@ int main(void) {
             birth_mask = rulesets[current_ruleset].birth;
             survival_mask = rulesets[current_ruleset].survival;
         }
+        else if (key == 'k' || key == 'K')
+            symmetry = (symmetry + 1) % 4;
         else if (key == 'm' || key == 'M') {
             /* Mutate: randomly flip one bit in birth or survival mask (bits 0-8) */
             int which = rand() % 18; /* 0-8: birth bits, 9-17: survival bits */
@@ -766,11 +802,11 @@ int main(void) {
 
             if (m->type == 1) { /* press */
                 int btn = m->button & 0x03;
-                if (btn == 0) { mouse_held = 1; grid_set(gx, gy); }
-                else if (btn == 2) { mouse_held = 2; grid_unset(gx, gy); }
+                if (btn == 0) { mouse_held = 1; sym_apply(gx, gy, grid_set); }
+                else if (btn == 2) { mouse_held = 2; sym_apply(gx, gy, grid_unset); }
             } else if (m->type == 3) { /* drag */
-                if (mouse_held == 1) grid_set(gx, gy);
-                else if (mouse_held == 2) grid_unset(gx, gy);
+                if (mouse_held == 1) sym_apply(gx, gy, grid_set);
+                else if (mouse_held == 2) sym_apply(gx, gy, grid_unset);
             } else if (m->type == 2) { /* release */
                 mouse_held = 0;
             }
