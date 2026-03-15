@@ -45,6 +45,10 @@
  *   Ctrl-P      Dump full timeline buffer as numbered image sequence
  *   Ctrl-S      Save state to numbered .life file
  *   Ctrl-O      Load most recent .life save (or Ctrl-O N for slot N)
+ *   X           Toggle temperature mode — stochastic noise field
+ *                 Left-click=paint hot, right-click=paint cold, scroll=brush size
+ *                 +/- adjust brush temperature, {/} adjust global temperature
+ *                 [/] adjust brush radius
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -104,6 +108,16 @@ static int entropy_mode = 0;    /* 0=off, 1=on */
 static int entropy_stale = 1;   /* 1=needs recomputation */
 static float entropy_global = 0.0f;    /* mean entropy across grid */
 static float entropy_max_local = 0.0f; /* max local entropy found */
+
+/* ── Temperature Field ──────────────────────────────────────────────────── */
+/* Stochastic temperature parameter: T=0 is deterministic, T>0 flips birth/death
+   decisions with probability T.  Spatial gradients create coexisting ordered
+   (cold/blue) and chaotic (hot/red) regions with visible phase boundaries. */
+static float temp_grid[MAX_H][MAX_W];  /* per-cell temperature 0.0–1.0 */
+static int   temp_mode = 0;            /* 0=off, 1=on (painting/overlay active) */
+static float temp_global = 0.0f;       /* global uniform temperature offset */
+static float temp_brush = 0.5f;        /* brush temperature for painting */
+static int   temp_brush_radius = 3;    /* brush radius for spatial painting */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -760,7 +774,7 @@ static void grid_clear(void) {
     memset(ghost, 0, sizeof(ghost));
     memset(tracer, 0, sizeof(tracer));
     memset(species, 0, sizeof(species));
-    /* zones are preserved across clear — use 'c' twice or toggle zone_mode to reset */
+    /* zones and temperature are preserved across clear — use 'c' twice to reset */
     generation = 0;
     population = 0;
     hist_count = 0;
@@ -856,6 +870,10 @@ static void grid_step(void) {
             if (ecosystem_mode) {
                 int alive = grid[y][x] > 0;
                 int my_sp = alive ? species[y][x] : 0;
+                /* Effective temperature for this cell */
+                float T_eco = temp_global + temp_grid[y][x];
+                if (T_eco > 1.0f) T_eco = 1.0f;
+                int t_flip = (T_eco > 0.0f && (float)rand() / (float)RAND_MAX < T_eco);
 
                 if (alive) {
                     /* Survival: use this species' rules with interaction-weighted neighbors */
@@ -866,7 +884,9 @@ static void grid_step(void) {
                     if (eff < 0) eff = 0;
                     if (eff > 15) eff = 15;
                     unsigned short s_mask = (my_sp == 1) ? species_a_survival : species_b_survival;
-                    if (s_mask & (1 << eff)) {
+                    int survives = (s_mask & (1 << eff)) != 0;
+                    if (t_flip) survives = !survives;
+                    if (survives) {
                         int age = grid[y][x];
                         next_grid[y][x] = (age < 255) ? age + 1 : 255;
                         next_species[y][x] = (unsigned char)my_sp;
@@ -884,6 +904,8 @@ static void grid_step(void) {
                     if (eff_b > 15) eff_b = 15;
                     int born_a = (species_a_birth & (1 << eff_a)) != 0;
                     int born_b = (species_b_birth & (1 << eff_b)) != 0;
+                    /* Temperature can spontaneously ignite or suppress birth */
+                    if (t_flip) { born_a = !born_a; born_b = !born_b; }
                     if (born_a && born_b) {
                         /* Both species want to birth — majority wins, random tiebreak */
                         next_species[y][x] = (n_a > n_b) ? 1 : (n_b > n_a) ? 2 : (unsigned char)((rand() % 2) + 1);
@@ -911,8 +933,16 @@ static void grid_step(void) {
                         s_mask = rulesets[zi].survival;
                     }
                 }
-                if ((alive && (s_mask & (1 << n))) ||
-                    (!alive && (b_mask & (1 << n)))) {
+                int outcome = (alive && (s_mask & (1 << n))) ||
+                              (!alive && (b_mask & (1 << n)));
+                /* Stochastic temperature: flip outcome with probability T */
+                {
+                    float T = temp_global + temp_grid[y][x];
+                    if (T > 1.0f) T = 1.0f;
+                    if (T > 0.0f && (float)rand() / (float)RAND_MAX < T)
+                        outcome = !outcome;
+                }
+                if (outcome) {
                     /* alive: increment age, cap at 255 */
                     int age = grid[y][x];
                     next_grid[y][x] = (age < 255) ? age + 1 : 255;
@@ -2178,6 +2208,29 @@ static RGB entropy_to_rgb(float h) {
     }
 }
 
+/* Temperature field: blue (cold/ordered) → white (mid) → red (hot/chaotic) */
+static RGB temp_to_rgb(float t) {
+    if (t <= 0.0f) return (RGB){15, 20, 80};        /* deep blue (cold) */
+    if (t >= 1.0f) return (RGB){255, 40, 20};        /* hot red */
+    if (t < 0.5f) {
+        /* Blue → white (0.0 → 0.5) */
+        float f = t * 2.0f;
+        return (RGB){
+            (unsigned char)(15 + f * 240),
+            (unsigned char)(20 + f * 235),
+            (unsigned char)(80 + f * 175)
+        };
+    } else {
+        /* White → red (0.5 → 1.0) */
+        float f = (t - 0.5f) * 2.0f;
+        return (RGB){
+            (unsigned char)(255),
+            (unsigned char)(255 - f * 215),
+            (unsigned char)(255 - f * 235)
+        };
+    }
+}
+
 /* ── Save / Load (.life files) ─────────────────────────────────────────────── */
 
 /*
@@ -2857,6 +2910,44 @@ static void zone_paint_sym(int gx, int gy) {
     }
 }
 
+/* ── Temperature painting ──────────────────────────────────────────────────── */
+static void temp_paint(int cx, int cy, float val, int radius) {
+    for (int dy = -radius; dy <= radius; dy++)
+        for (int dx = -radius; dx <= radius; dx++) {
+            if (dx*dx + dy*dy > radius*radius) continue;
+            int x = cx + dx, y = cy + dy;
+            if (x < 0 || x >= W || y < 0 || y >= H) continue;
+            /* Gaussian-like falloff from center */
+            float dist = sqrtf((float)(dx*dx + dy*dy)) / (float)radius;
+            float strength = 1.0f - dist;
+            if (strength < 0.0f) strength = 0.0f;
+            /* Blend toward brush value */
+            temp_grid[y][x] = temp_grid[y][x] * (1.0f - strength) + val * strength;
+            if (temp_grid[y][x] < 0.0f) temp_grid[y][x] = 0.0f;
+            if (temp_grid[y][x] > 1.0f) temp_grid[y][x] = 1.0f;
+        }
+}
+
+static void temp_paint_sym(int gx, int gy) {
+    int cx = W / 2, cy = H / 2;
+    int dx = gx - cx, dy = gy - cy;
+
+    temp_paint(gx, gy, temp_brush, temp_brush_radius);
+
+    if (symmetry >= 1)
+        temp_paint(cx - dx, gy, temp_brush, temp_brush_radius);
+    if (symmetry >= 2) {
+        temp_paint(gx, cy - dy, temp_brush, temp_brush_radius);
+        temp_paint(cx - dx, cy - dy, temp_brush, temp_brush_radius);
+    }
+    if (symmetry >= 3) {
+        temp_paint(cx + dy, cy + dx, temp_brush, temp_brush_radius);
+        temp_paint(cx - dy, cy + dx, temp_brush, temp_brush_radius);
+        temp_paint(cx + dy, cy - dx, temp_brush, temp_brush_radius);
+        temp_paint(cx - dy, cy - dx, temp_brush, temp_brush_radius);
+    }
+}
+
 /* ── Sparkline rendering ───────────────────────────────────────────────────── */
 
 /* Unicode block elements for sparkline: 8 levels */
@@ -3427,6 +3518,37 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Temperature field overlay: show thermal landscape as blue→red wash */
+    if (temp_mode) {
+        float t = temp_global + temp_grid[y][x];
+        if (t > 1.0f) t = 1.0f;
+        if (t > 0.001f || grid[y][x]) {
+            RGB trgb = temp_to_rgb(t);
+            if (grid[y][x]) {
+                /* Blend: 50% cell base color + 50% temperature wash for alive cells */
+                RGB base;
+                if (ecosystem_mode && species[y][x] > 0) {
+                    base = (species[y][x] == 1) ? species_a_to_rgb(grid[y][x])
+                                                 : species_b_to_rgb(grid[y][x]);
+                } else if (heatmap_mode) {
+                    base = age_to_rgb(grid[y][x]);
+                } else {
+                    base = (RGB){0, 200, 0};
+                }
+                out->r = (unsigned char)(base.r / 2 + trgb.r / 2);
+                out->g = (unsigned char)(base.g / 2 + trgb.g / 2);
+                out->b = (unsigned char)(base.b / 2 + trgb.b / 2);
+            } else {
+                /* Dead cells: dim temperature wash */
+                out->r = trgb.r / 3;
+                out->g = trgb.g / 3;
+                out->b = trgb.b / 3;
+            }
+            return grid[y][x] ? 1 : 9; /* 9 = temperature ghost */
+        }
+        return 0;
+    }
+
     /* Census spaceship overlay: cyan for detected moving structures */
     if (census_mode && grid[y][x] && census_ship[y][x]) {
         int age = grid[y][x];
@@ -3602,6 +3724,27 @@ static void render(int running, int speed_ms, int draw_mode) {
                  sp_clr, sp_name, int_sign, int_abs);
     }
 
+    /* Temperature mode indicator */
+    char temp_str[128] = "";
+    if (temp_mode) {
+        float eff_max = temp_global;
+        float t_sum = 0.0f;
+        int t_nonzero = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                float t = temp_grid[y][x];
+                if (t > 0.001f) { t_sum += t; t_nonzero++; }
+                if (t + temp_global > eff_max) eff_max = t + temp_global;
+            }
+        float t_mean = t_nonzero > 0 ? t_sum / t_nonzero : 0.0f;
+        snprintf(temp_str, sizeof(temp_str),
+                 " \033[38;2;255;120;60m\xe2\x96\x93" "TEMP:G%.2f B%.2f\033[0m",
+                 temp_global, temp_brush);
+    } else if (temp_global > 0.001f) {
+        snprintf(temp_str, sizeof(temp_str),
+                 " \033[90m\xe2\x96\x93" "T:%.2f\033[0m", temp_global);
+    }
+
     /* Zone mode indicator */
     char zone_str[80] = "";
     if (zone_mode) {
@@ -3638,9 +3781,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, census_str, gene_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -3665,7 +3808,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent "
-                     "[/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[X]temp [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
@@ -4258,6 +4401,115 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", erst);
     }
 
+    /* ── Temperature Field overlay panel ──────────────────────────────────── */
+    if (temp_mode) {
+        int tp_w = 44;
+        int tp_col = term_cols - tp_w - 2;
+        int tp_row = entropy_mode ? 12 : 3; /* below entropy panel if both active */
+        if (tp_col < 1) tp_col = 1;
+
+        const char *tbdr = "\033[38;2;255;140;60;48;2;16;8;4m";
+        const char *tbg  = "\033[48;2;16;8;4m";
+        const char *trst  = "\033[0m";
+
+        /* Compute stats */
+        float t_sum = 0.0f, t_max = 0.0f;
+        int t_nonzero = 0;
+        for (int ty = 0; ty < H; ty++)
+            for (int tx = 0; tx < W; tx++) {
+                float t = temp_grid[ty][tx];
+                if (t > 0.001f) { t_sum += t; t_nonzero++; }
+                if (t > t_max) t_max = t;
+            }
+        float t_mean = t_nonzero > 0 ? (t_sum / t_nonzero) : 0.0f;
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Temperature ",
+                     tp_row, tp_col, tbdr);
+        for (int i = 14; i < tp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", trst);
+
+        /* Stats row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 1, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;255;180;100mGlobal=\033[38;2;255;255;255m%.3f"
+                     "  \033[38;2;255;180;100mBrush=\033[38;2;255;255;255m%.2f"
+                     "  \033[38;2;255;180;100mr=\033[38;2;255;255;255m%d",
+                     temp_global, temp_brush, temp_brush_radius);
+        /* Pad */
+        p += sprintf(p, "%s", tbg);
+        for (int i = 0; i < 4; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Stats row 2 */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 2, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;255;180;100mT\xcc\x84=\033[38;2;255;255;255m%.4f"
+                     "  \033[38;2;255;180;100mT\xe2\x82\x98\xe2\x82\x90\xe2\x82\x93=\033[38;2;255;255;255m%.4f"
+                     "  \033[38;2;255;180;100mhot=\033[38;2;255;255;255m%d",
+                     t_mean, t_max, t_nonzero);
+        p += sprintf(p, "%s", tbg);
+        for (int i = 0; i < 6; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Distribution histogram: bin temperature into 10 buckets */
+        int tbins[10] = {0};
+        for (int ty = 0; ty < H; ty++)
+            for (int tx = 0; tx < W; tx++) {
+                float t = temp_grid[ty][tx] + temp_global;
+                if (t > 1.0f) t = 1.0f;
+                int b = (int)(t * 9.99f);
+                if (b < 0) b = 0;
+                if (b > 9) b = 9;
+                tbins[b]++;
+            }
+        int tbmax = 1;
+        for (int i = 0; i < 10; i++)
+            if (tbins[i] > tbmax) tbmax = tbins[i];
+
+        /* Label row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 3, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;60;80;140m0.0");
+        for (int i = 0; i < 22; i++) *p++ = ' ';
+        p += sprintf(p, "\033[38;2;120;90;80mTemperature");
+        for (int i = 0; i < 4; i++) *p++ = ' ';
+        p += sprintf(p, "1.0 ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* 4 rows of histogram bars */
+        for (int row = 0; row < 4; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                         tp_row + 4 + row, tp_col, tbdr, tbg);
+            int level = 3 - row;
+            for (int b = 0; b < 10; b++) {
+                int bar_h = tbins[b] * 4 / tbmax;
+                for (int c = 0; c < 4; c++) {
+                    if (bar_h > level) {
+                        RGB bc = temp_to_rgb((float)b / 9.0f);
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88",
+                                     bc.r, bc.g, bc.b);
+                    } else if (bar_h == level) {
+                        RGB bc = temp_to_rgb((float)b / 9.0f);
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84",
+                                     bc.r/2, bc.g/2, bc.b/2);
+                    } else {
+                        p += sprintf(p, "\033[38;2;20;12;8m\xc2\xb7");
+                    }
+                }
+            }
+            *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+        }
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", tp_row + 8, tp_col, tbdr);
+        for (int i = 0; i < tp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", trst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -4633,8 +4885,10 @@ int main(int argc, char **argv) {
         }
         else if (key == 'c' || key == 'C') {
             if (population == 0 && generation == 0) {
-                /* Second clear: also reset zones, emitters/absorbers, and portals */
+                /* Second clear: also reset zones, temperature, emitters/absorbers, and portals */
                 zones_clear();
+                memset(temp_grid, 0, sizeof(temp_grid));
+                temp_global = 0.0f;
                 n_emitters = 0;
                 n_absorbers = 0;
                 n_portals = 0;
@@ -4653,14 +4907,20 @@ int main(int argc, char **argv) {
             }
         }
         else if (key == '+' || key == '=') {
-            if (emit_mode) {
+            if (temp_mode) {
+                temp_brush += 0.05f;
+                if (temp_brush > 1.0f) temp_brush = 1.0f;
+            } else if (emit_mode) {
                 emit_rate = emit_rate > 1 ? emit_rate - 1 : 1;
             } else {
                 speed_ms = speed_ms > 20 ? speed_ms - 20 : 20;
             }
         }
         else if (key == '-' || key == '_') {
-            if (emit_mode) {
+            if (temp_mode) {
+                temp_brush -= 0.05f;
+                if (temp_brush < 0.0f) temp_brush = 0.0f;
+            } else if (emit_mode) {
                 emit_rate = emit_rate < 20 ? emit_rate + 1 : 20;
             } else {
                 speed_ms = speed_ms < 1000 ? speed_ms + 20 : 1000;
@@ -4700,7 +4960,9 @@ int main(int argc, char **argv) {
             }
         }
         else if (key == ']') {
-            if (stamp_mode) {
+            if (temp_mode) {
+                temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
+            } else if (stamp_mode) {
                 stamp_sel = (stamp_sel + 1) % N_STAMPS;
             } else if (emit_mode) {
                 emit_pattern = (emit_pattern + 1) % N_EMIT_PATTERNS;
@@ -4713,7 +4975,9 @@ int main(int argc, char **argv) {
             }
         }
         else if (key == '[') {
-            if (stamp_mode) {
+            if (temp_mode) {
+                temp_brush_radius = temp_brush_radius > 1 ? temp_brush_radius - 1 : 1;
+            } else if (stamp_mode) {
                 stamp_sel = (stamp_sel - 1 + N_STAMPS) % N_STAMPS;
             } else if (emit_mode) {
                 emit_pattern = (emit_pattern - 1 + N_EMIT_PATTERNS) % N_EMIT_PATTERNS;
@@ -4791,17 +5055,37 @@ int main(int argc, char **argv) {
             }
             printf("\033[2J"); fflush(stdout);
         }
+        else if (key == 'X') {
+            temp_mode = !temp_mode;
+            if (temp_mode) {
+                emit_mode = 0; stamp_mode = 0;
+                portal_mode = 0; portal_placing = 0;
+                zone_mode = 0;
+                draw_mode = 1;
+            }
+            printf("\033[2J"); fflush(stdout);
+        }
         else if (key == '6') {
             if (ecosystem_mode)
                 brush_species = (brush_species == 1) ? 2 : 1;
         }
         else if (key == '{') {
-            interaction -= 0.1f;
-            if (interaction < -1.0f) interaction = -1.0f;
+            if (temp_mode) {
+                temp_global -= 0.01f;
+                if (temp_global < 0.0f) temp_global = 0.0f;
+            } else {
+                interaction -= 0.1f;
+                if (interaction < -1.0f) interaction = -1.0f;
+            }
         }
         else if (key == '}') {
-            interaction += 0.1f;
-            if (interaction > 1.0f) interaction = 1.0f;
+            if (temp_mode) {
+                temp_global += 0.01f;
+                if (temp_global > 1.0f) temp_global = 1.0f;
+            } else {
+                interaction += 0.1f;
+                if (interaction > 1.0f) interaction = 1.0f;
+            }
         }
         else if (key == 'm' || key == 'M') {
             /* Mutate: randomly flip one bit in birth or survival mask (bits 0-8) */
@@ -4866,6 +5150,11 @@ int main(int argc, char **argv) {
                     portal_radius = portal_radius < 6 ? portal_radius + 1 : 6;
                 else
                     portal_radius = portal_radius > 2 ? portal_radius - 1 : 2;
+            } else if (temp_mode && m->type == 1 && (btn == 64 || btn == 65)) {
+                if (btn == 64)
+                    temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
+                else
+                    temp_brush_radius = temp_brush_radius > 1 ? temp_brush_radius - 1 : 1;
             } else if (emit_mode && m->type == 1 && (btn == 64 || btn == 65)) {
                 if (btn == 64)
                     absorb_radius = absorb_radius < 10 ? absorb_radius + 1 : 10;
@@ -4979,6 +5268,29 @@ int main(int argc, char **argv) {
                     }
                     /* No drag support for emit — one click per placement */
                     if (m->type == 2) mouse_held = 0;
+                } else if (temp_mode) {
+                    /* Temperature painting: left=paint hot, right=paint cold (T=0) */
+                    if (m->type == 1) {
+                        int mbtn = btn & 0x03;
+                        if (mbtn == 0) { mouse_held = 1; temp_paint_sym(gx, gy); }
+                        else if (mbtn == 2) {
+                            mouse_held = 2;
+                            float save = temp_brush;
+                            temp_brush = 0.0f;
+                            temp_paint_sym(gx, gy);
+                            temp_brush = save;
+                        }
+                    } else if (m->type == 3) {
+                        if (mouse_held == 1) temp_paint_sym(gx, gy);
+                        else if (mouse_held == 2) {
+                            float save = temp_brush;
+                            temp_brush = 0.0f;
+                            temp_paint_sym(gx, gy);
+                            temp_brush = save;
+                        }
+                    } else if (m->type == 2) {
+                        mouse_held = 0;
+                    }
                 } else if (zone_mode) {
                     /* Zone painting mode: left=paint zone, right=reset to zone 0 */
                     if (m->type == 1) {
