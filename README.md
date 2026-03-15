@@ -57,6 +57,7 @@ Requires only `gcc` and a POSIX terminal.
 | `9` | Toggle causal light cone — click cell to trace backward/forward cones |
 | `!` | Toggle prediction surprise field (per-cell transition surprisal heatmap) |
 | `@` | Toggle mutual information network (inter-region coupling map) |
+| `#` | Toggle composite complexity index (edge-of-chaos heatmap) |
 | `+`/`-` (in cone) | Adjust forward cone depth |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
@@ -442,6 +443,24 @@ The overlay panel displays max MI, mean MI, network density (fraction of pairs a
 
 Recomputes every 8 generations while running. Requires ≥16 frames of history for meaningful results.
 
+### Composite Complexity Index
+
+Toggle with `#`. Fuses four existing analyzers — **entropy**, **Lyapunov sensitivity**, **prediction surprise**, and **frequency analysis** — into a single per-cell **edge-of-chaos complexity score** (0.0–1.0). This brings the Wolfram class concept down to cell-level spatial resolution, highlighting exactly where Class IV dynamics are happening.
+
+The composite score is computed as a weighted sum with a concave edge-boost:
+```
+raw = 0.30·entropy + 0.25·lyapunov + 0.25·surprise + 0.20·frequency
+complexity = 0.7·(4·raw·(1-raw)) + 0.3·raw
+```
+
+The `4·raw·(1-raw)` term peaks at raw=0.5, rewarding balanced moderate signals (the hallmark of edge-of-chaos dynamics) over uniformly high signals (pure chaos) or uniformly low (dead/periodic).
+
+**Color map:** deep blue (simple/dead) → teal-green (periodic) → bright gold (edge-of-chaos sweet spot) → red (fully chaotic). The gold band at 0.4–0.7 marks regions where interesting structures — gliders, long transients, localized computation — tend to live.
+
+The overlay panel displays mean complexity, max complexity, counts of simple/edge/chaotic cells, percentage of alive cells in the edge band, and a color legend gradient.
+
+Recomputes every 4 generations while running.
+
 ## Implementation Details
 
 - Double-buffered grid updates for correct neighbor counting
@@ -465,6 +484,7 @@ Recomputes every 8 generations while running. Requires ≥16 frames of history f
 - Screenshot capture — single-frame PPM export via `cell_color()` pipeline, plus full timeline sequence dump with grid state save/restore, auto-numbered filenames up to 9999
 - Pattern stamp tool — 20 classic patterns across 5 categories with pre-computed rotations, preview overlay, and full integration with symmetry/species/zones
 - Live pattern census — real-time structure recognition via bitmask matching with dead-border verification for 14 pattern templates (8 still lifes + 6 oscillator phases), color-coded overlay panel, unclaimed cell tracking, and 16-generation refresh cycle
+- Composite complexity index — per-cell edge-of-chaos score fusing entropy, Lyapunov, surprise, and frequency via weighted sum with concave edge-boost transform, 4-generation refresh cycle
 - Mutual information network — inter-region coupling map partitioning grid into 20×10 blocks, computing MI for all ~20K block pairs over 256-frame history, Bresenham line rendering of top-40 couplings, clustering coefficient, and 8-generation refresh cycle
 - Dual-species ecosystem — two coexisting cell populations with independent B/S rules, species-aware neighbor counting, configurable interaction coefficient (-1.0 hostile to +1.0 cooperative), species-specific color gradients, and birth arbitration
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)

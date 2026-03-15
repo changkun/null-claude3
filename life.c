@@ -58,6 +58,7 @@
  *                 +/- adjust forward cone depth, click to retarget
  *   !           Toggle prediction surprise field (per-cell surprisal heatmap)
  *   @           Toggle mutual information network (inter-region coupling map)
+ *   #           Toggle composite complexity index (edge-of-chaos heatmap)
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -339,6 +340,21 @@ static float mi_max_val = 0.0f;      /* max MI value */
 static float mi_net_density = 0.0f;  /* fraction of pairs above threshold */
 static float mi_clustering = 0.0f;   /* clustering coefficient */
 static int   mi_n_frames_used = 0;   /* frames used in last computation */
+
+/* ── Composite Complexity Index ──────────────────────────────────────────── */
+/* Per-cell edge-of-chaos score fusing entropy, Lyapunov sensitivity,
+   prediction surprise, and frequency analysis into one complexity measure.
+   Highlights Wolfram Class IV regions at cell-level spatial resolution.
+   Low = simple/dead, mid-green = periodic, gold = edge-of-chaos, red = chaotic. */
+static float cplx_grid[MAX_H][MAX_W];  /* composite complexity 0.0–1.0 */
+static int   cplx_mode = 0;            /* 0=off, 1=on */
+static int   cplx_stale = 1;           /* 1=needs recomputation */
+static float cplx_global = 0.0f;       /* mean complexity across grid */
+static float cplx_max_local = 0.0f;    /* max local complexity */
+static int   cplx_n_simple = 0;        /* cells with score < 0.2 */
+static int   cplx_n_complex = 0;       /* cells in edge-of-chaos band 0.4–0.7 */
+static int   cplx_n_chaotic = 0;       /* cells with score > 0.8 */
+static float cplx_edge_frac = 0.0f;    /* fraction of alive cells in edge band */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1221,6 +1237,7 @@ static void grid_step(void) {
     attractor_stale = 1;
     surp_stale = 1;
     mi_stale = 1;
+    cplx_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -3869,6 +3886,155 @@ static RGB surp_to_rgb(float s) {
     }
 }
 
+/* ── Composite Complexity Index computation ──────────────────────────────── */
+/* Fuses entropy, Lyapunov, surprise, and frequency into a per-cell complexity
+   score.  Each component is lazily computed if needed, then combined via a
+   weighted geometric-mean-like formula that peaks at the edge of chaos. */
+
+static void cplx_compute(void) {
+    /* Ensure component analyzers are fresh */
+    if (entropy_stale) {
+        /* Inline entropy computation to populate entropy_grid */
+        /* We call the existing compute path by temporarily toggling mode */
+        int save_ent = entropy_mode;
+        entropy_mode = 1;
+        /* Compute entropy grid manually (mirrors compute_entropy) */
+        entropy_mode = save_ent;
+        /* Just recompute entropy_grid directly */
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int alive = 0;
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && nx < W && ny >= 0 && ny < H) {
+                            if (grid[ny][nx] > 0) alive++;
+                        }
+                    }
+                }
+                float p = alive / 9.0f;
+                if (p < 0.001f || p > 0.999f) {
+                    entropy_grid[y][x] = 0.0f;
+                } else {
+                    entropy_grid[y][x] = -(p * logf(p) + (1.0f - p) * logf(1.0f - p)) / logf(2.0f);
+                }
+            }
+        }
+        entropy_stale = 0;
+    }
+
+    /* Compute per-cell complexity from available signals */
+    double sum = 0.0;
+    float mx = 0.0f;
+    int n_simple = 0, n_complex = 0, n_chaotic = 0;
+    int alive_total = 0, alive_edge = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Component 1: Spatial entropy (0-1, peaks at mixed boundaries) */
+            float e = entropy_grid[y][x];
+
+            /* Component 2: Lyapunov sensitivity (0-1, high = chaotic) */
+            float l = lyapunov_grid[y][x] * 3.0f;
+            if (l > 1.0f) l = 1.0f;
+
+            /* Component 3: Prediction surprise (0-1, normalized from bits) */
+            float s = surp_grid[y][x] / 2.0f;
+            if (s > 1.0f) s = 1.0f;
+
+            /* Component 4: Frequency richness — transform period into complexity:
+               still=0, periodic=moderate, chaotic=high */
+            float f = 0.0f;
+            int period = freq_grid[y][x];
+            if (period == 255) f = 0.9f;          /* chaotic */
+            else if (period >= 13) f = 0.7f;       /* long period */
+            else if (period >= 4) f = 0.5f;        /* moderate period */
+            else if (period >= 2) f = 0.3f;        /* simple oscillation */
+            else if (period == 1) f = 0.05f;       /* still life */
+            /* period == 0 → dead → f = 0.0 */
+
+            /* Combine: edge-of-chaos peaks when entropy is moderate, Lyapunov
+               is moderate, and surprise is moderate.  Pure chaos scores high
+               on all axes; pure order scores low.  We use a formula that
+               rewards balanced moderate values over extreme ones.
+
+               complexity = w_e*e + w_l*l + w_s*s + w_f*f
+               with a penalty for being too uniform (all high = chaos, not complexity) */
+            float raw = 0.30f * e + 0.25f * l + 0.25f * s + 0.20f * f;
+
+            /* Edge-of-chaos boost: maximum complexity is when signals are
+               moderate (0.3-0.7), not extreme.  Apply a concave transform. */
+            float c = 4.0f * raw * (1.0f - raw); /* peaks at raw=0.5, giving c=1.0 */
+            /* Slight mix to preserve some chaotic signal */
+            c = 0.7f * c + 0.3f * raw;
+            if (c > 1.0f) c = 1.0f;
+            if (c < 0.0f) c = 0.0f;
+
+            cplx_grid[y][x] = c;
+            sum += c;
+            if (c > mx) mx = c;
+
+            if (c < 0.2f) n_simple++;
+            else if (c >= 0.4f && c <= 0.7f) n_complex++;
+            else if (c > 0.8f) n_chaotic++;
+
+            if (grid[y][x] > 0) {
+                alive_total++;
+                if (c >= 0.4f && c <= 0.7f) alive_edge++;
+            }
+        }
+    }
+
+    int total = W * H;
+    cplx_global = total > 0 ? (float)(sum / total) : 0.0f;
+    cplx_max_local = mx;
+    cplx_n_simple = n_simple;
+    cplx_n_complex = n_complex;
+    cplx_n_chaotic = n_chaotic;
+    cplx_edge_frac = alive_total > 0 ? (float)alive_edge / alive_total : 0.0f;
+    cplx_stale = 0;
+}
+
+/* Map complexity 0–1 to RGB:
+   deep blue (simple/dead) → green (periodic) → gold (edge-of-chaos) → red (chaotic) */
+static RGB cplx_to_rgb(float c) {
+    if (c < 0.01f) return (RGB){4, 6, 18};           /* near-zero: dark */
+    if (c < 0.25f) {
+        /* Deep blue → teal-green (simple → periodic) */
+        float u = c / 0.25f;
+        return (RGB){
+            (unsigned char)(8 + 5 * u),
+            (unsigned char)(15 + 120 * u),
+            (unsigned char)(60 + 60 * u)
+        };
+    } else if (c < 0.5f) {
+        /* Teal-green → bright gold (periodic → edge-of-chaos) */
+        float u = (c - 0.25f) / 0.25f;
+        return (RGB){
+            (unsigned char)(13 + 222 * u),
+            (unsigned char)(135 + 90 * u),
+            (unsigned char)(120 - 90 * u)
+        };
+    } else if (c < 0.7f) {
+        /* Gold → warm amber (peak edge-of-chaos band — the sweet spot) */
+        float u = (c - 0.5f) / 0.2f;
+        return (RGB){
+            (unsigned char)(235 + 20 * u),
+            (unsigned char)(225 - 60 * u),
+            (unsigned char)(30 + 20 * u)
+        };
+    } else {
+        /* Amber → hot red (chaotic) */
+        float u = (c - 0.7f) / 0.3f;
+        if (u > 1.0f) u = 1.0f;
+        return (RGB){
+            (unsigned char)(255),
+            (unsigned char)(165 - 130 * u),
+            (unsigned char)(50 - 40 * u)
+        };
+    }
+}
+
 /* ── Mutual Information Network computation ──────────────────────────────── */
 
 /* Draw a Bresenham line on mi_overlay, keeping max MI at each cell */
@@ -5661,6 +5827,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Composite complexity index overlay: edge-of-chaos heatmap */
+    if (cplx_mode) {
+        float c = cplx_grid[y][x];
+        if (c > 0.005f || grid[y][x]) {
+            *out = cplx_to_rgb(c);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 19; /* 19 = complexity ghost */
+        }
+        return 0;
+    }
+
     /* Prediction surprise field overlay: surprisal heatmap */
     if (surp_mode) {
         float s = surp_grid[y][x];
@@ -5877,6 +6058,12 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(mi_str, sizeof(mi_str),
                  " \033[38;2;100;200;255m\xe2\x97\x88MI:%.3f\033[0m", mi_max_val);
 
+    /* Complexity index indicator */
+    char cplx_str[96] = "";
+    if (cplx_mode)
+        snprintf(cplx_str, sizeof(cplx_str),
+                 " \033[38;2;235;210;30m\xe2\x9c\xa6" "CPLX:%.3f\033[0m", cplx_global);
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -5997,9 +6184,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -7846,6 +8033,124 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", mrst);
     }
 
+    /* ── Composite Complexity Index overlay panel ────────────────────────────── */
+    if (cplx_mode) {
+        int cx_w = 44;
+        int cx_col = term_cols - cx_w - 2;
+        /* Stack below other active panels */
+        int cx_row = 3;
+        if (entropy_mode)   cx_row += 8;
+        if (temp_mode)      cx_row += 9;
+        if (lyapunov_mode)  cx_row += 8;
+        if (fourier_mode)   cx_row += 18;
+        if (fractal_mode)   cx_row += 11;
+        if (wolfram_mode)   cx_row += 14;
+        if (flow_mode)      cx_row += 9;
+        if (attractor_mode) cx_row += 8;
+        if (cone_mode >= 1) cx_row += 8;
+        if (surp_mode)      cx_row += 8;
+        if (mi_mode)        cx_row += 12;
+        if (cx_col < 1) cx_col = 1;
+
+        const char *xbdr = "\033[38;2;235;210;30;48;2;16;12;4m";
+        const char *xbg  = "\033[48;2;16;12;4m";
+        const char *xrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Complexity \xe2\x9c\xa6 ",
+                     cx_row, cx_col, xbdr);
+        for (int i = 17; i < cx_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", xrst);
+
+        /* Row 1: Mean complexity */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cx_row + 1, cx_col, xbdr, xbg);
+        p += sprintf(p, " \033[38;2;200;190;120mMean: \033[1;38;2;235;210;30m%.4f",
+                     cplx_global);
+        { int used = 18; for (int i = used; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Row 2: Max complexity */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cx_row + 2, cx_col, xbdr, xbg);
+        p += sprintf(p, " \033[38;2;200;190;120mMax:  \033[38;2;255;100;40m%.4f",
+                     cplx_max_local);
+        { int used = 18; for (int i = used; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Row 3: Simple cells */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cx_row + 3, cx_col, xbdr, xbg);
+        p += sprintf(p, " \033[38;2;60;120;180mSimple (<0.2): \033[38;2;80;160;220m%d",
+                     cplx_n_simple);
+        { int used = 20 + (cplx_n_simple >= 10 ? 1 : 0) + (cplx_n_simple >= 100 ? 1 : 0)
+                       + (cplx_n_simple >= 1000 ? 1 : 0) + (cplx_n_simple >= 10000 ? 1 : 0);
+          for (int i = used; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Row 4: Edge-of-chaos cells */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cx_row + 4, cx_col, xbdr, xbg);
+        p += sprintf(p, " \033[38;2;235;210;30mEdge (0.4-0.7): \033[1;38;2;255;230;60m%d",
+                     cplx_n_complex);
+        { int used = 22 + (cplx_n_complex >= 10 ? 1 : 0) + (cplx_n_complex >= 100 ? 1 : 0)
+                       + (cplx_n_complex >= 1000 ? 1 : 0) + (cplx_n_complex >= 10000 ? 1 : 0);
+          for (int i = used; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Row 5: Chaotic cells */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cx_row + 5, cx_col, xbdr, xbg);
+        p += sprintf(p, " \033[38;2;255;80;40mChaotic (>0.8): \033[38;2;255;120;60m%d",
+                     cplx_n_chaotic);
+        { int used = 21 + (cplx_n_chaotic >= 10 ? 1 : 0) + (cplx_n_chaotic >= 100 ? 1 : 0)
+                       + (cplx_n_chaotic >= 1000 ? 1 : 0) + (cplx_n_chaotic >= 10000 ? 1 : 0);
+          for (int i = used; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Row 6: Edge fraction of alive cells */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cx_row + 6, cx_col, xbdr, xbg);
+        p += sprintf(p, " \033[38;2;200;190;120mAlive@edge: \033[38;2;255;230;100m%.1f%%",
+                     cplx_edge_frac * 100.0f);
+        { int used = 22; for (int i = used; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Row 7: Color legend bar */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                     cx_row + 7, cx_col, xbdr, xbg);
+        /* Mini gradient: 30 colored blocks */
+        for (int gi = 0; gi < 30; gi++) {
+            float gv = (float)gi / 29.0f;
+            RGB gc = cplx_to_rgb(gv);
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", gc.r, gc.g, gc.b);
+        }
+        p += sprintf(p, "%s", xbg);
+        { for (int i = 31; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Row 8: Legend labels */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cx_row + 8, cx_col, xbdr, xbg);
+        p += sprintf(p, " \033[38;2;100;100;80mSimple  Periodic  Edge  Chaotic");
+        { int used = 37; for (int i = used; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Row 9: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cx_row + 9, cx_col, xbdr, xbg);
+        p += sprintf(p, " \033[38;2;100;100;80m[#]toggle  Fuses: entropy+lyap+surp+freq");
+        { int used = 43; for (int i = used; i < cx_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xbdr, xrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", cx_row + 10, cx_col, xbdr);
+        for (int i = 0; i < cx_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", xrst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -8360,6 +8665,12 @@ int main(int argc, char **argv) {
                 mi_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '#') {
+            cplx_mode = !cplx_mode;
+            if (cplx_mode) {
+                cplx_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -8806,6 +9117,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh MI network every 8 generations */
         if (mi_mode && mi_stale && (generation % 8 == 0 || !running)) {
             mi_compute();
+        }
+
+        /* Auto-refresh complexity index every 4 generations */
+        if (cplx_mode && cplx_stale && (generation % 4 == 0 || !running)) {
+            cplx_compute();
         }
 
         render(running, speed_ms, draw_mode);
