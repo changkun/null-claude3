@@ -46,6 +46,7 @@ Requires only `gcc` and a POSIX terminal.
 | `{` / `}` | Adjust cross-species interaction coefficient (-1.0 to +1.0) |
 | `P` | Screenshot — save viewport as PPM image (`frame_NNNN.ppm`) |
 | `Ctrl-P` | Dump full timeline buffer as numbered PPM image sequence |
+| `v` | Toggle live pattern census overlay |
 | `S` | Toggle pattern stamp mode (place classic structures) |
 | `[` / `]` | Cycle stamp pattern (in stamp mode) |
 | Scroll wheel | Rotate stamp 0°/90°/180°/270° (in stamp mode) |
@@ -263,6 +264,35 @@ Adjust with `{` / `}` in increments of 0.1.
 The minimap shows species A in blue, species B in red, and mixed regions in purple.
 Species data is fully integrated with timeline replay and save/load.
 
+## Live Pattern Census Overlay
+
+Press `v` to toggle the **pattern census overlay** — a real-time structure recognition system
+that scans the grid and identifies known Game of Life patterns by exact bitmask matching.
+
+### Recognized Patterns
+
+| Category | Patterns |
+|----------|----------|
+| Still lifes (green) | Block, Beehive, Loaf, Boat, Tub, Ship, Barge, Long Boat |
+| Oscillators (amber) | Blinker (both phases), Toad (both phases), Beacon (both phases) |
+
+The census uses **dead-border verification** — patterns are only counted when they are properly
+isolated (surrounded by dead cells), ensuring accurate identification of distinct structures
+rather than false positives from larger aggregates.
+
+### Display
+
+The overlay panel shows color-coded counts:
+- **Green** — still life counts (8 types)
+- **Amber** — oscillator counts (3 types, detecting both phase orientations)
+- **Unclaimed** — live cells that don't belong to any recognized pattern
+
+### Performance
+
+The census updates every **16 generations** to maintain smooth rendering, using a `census_stale`
+flag to avoid redundant scans. The 14 pattern templates (8 still lifes + 6 oscillator phases)
+are matched against the full 400×200 grid each update cycle.
+
 ## Pattern Stamp Tool
 
 Press `S` to enter **stamp mode** — a library of 20 classic Game of Life patterns that can be
@@ -348,6 +378,7 @@ grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmet
 - Wormhole portals — paired non-local spatial couplings with additive neighbor model, animated ring visualization, positional offset mapping, and bidirectional coupling across up to 8 portal pairs
 - Screenshot capture — single-frame PPM export via `cell_color()` pipeline, plus full timeline sequence dump with grid state save/restore, auto-numbered filenames up to 9999
 - Pattern stamp tool — 20 classic patterns across 5 categories with pre-computed rotations, preview overlay, and full integration with symmetry/species/zones
+- Live pattern census — real-time structure recognition via bitmask matching with dead-border verification for 14 pattern templates (8 still lifes + 6 oscillator phases), color-coded overlay panel, unclaimed cell tracking, and 16-generation refresh cycle
 - Dual-species ecosystem — two coexisting cell populations with independent B/S rules, species-aware neighbor counting, configurable interaction coefficient (-1.0 hostile to +1.0 cooperative), species-specific color gradients, and birth arbitration
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)
