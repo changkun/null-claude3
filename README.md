@@ -40,6 +40,7 @@ Requires only `gcc` and a POSIX terminal.
 | `t` | Toggle timeline scrubber bar |
 | `T` | Cycle signal tracer: off → accumulate → frozen → clear+off |
 | `f` | Toggle frequency analysis overlay (period detection heatmap) |
+| `W` | Toggle wormhole portal placement mode |
 | `Ctrl-S` | Save state to numbered `.life` file |
 | `Ctrl-O` | Load most recent `.life` save |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |
@@ -187,6 +188,34 @@ This mode is especially revealing for patterns like:
 
 The analysis auto-refreshes every 8 generations while the simulation runs.
 
+## Wormhole Portals
+
+Press `W` to enter **portal placement mode** — create paired wormholes that tunnel cells
+between distant grid regions, breaking the fundamental locality assumption of cellular automata.
+
+### Placement
+- **Left-click** once to place the entrance (cyan ring), click again to place the exit (magenta ring)
+- **Right-click** cancels mid-placement or removes an existing portal under the cursor
+- **Scroll wheel** adjusts portal radius (2–6 cells)
+- Up to 8 portal pairs can coexist
+
+### How it works
+Cells within a portal's radius see **extra neighbors** from the paired endpoint, mapped by
+positional offset — a cell 2 units left of entrance A sees neighbors 2 units left of exit B.
+Coupling is bidirectional: both endpoints contribute neighbors to each other.
+
+Because portal neighbors are *additive* (on top of the normal 8), cells near portals can have
+**>8 effective neighbors**, creating overpopulation pressure under standard rules. This produces:
+
+- **Glider tunneling** — streams enter one portal and emerge from the other
+- **Cross-zone bleeding** — connect two different ruleset zones and watch their physics interfere
+- **Oscillation disruption** — stable oscillators near portals destabilize from non-local influence
+- **Emergent boundary effects** — the portal perimeter itself becomes a site of unusual activity
+
+Portals are saved/loaded with `.life` files and render at all zoom levels with animated
+swirling rings (cyan for entrances, magenta for exits). Press `c` twice to clear portals
+along with zones and emitters.
+
 ## Save & Load
 
 Press `Ctrl-S` to save the full simulation state to a numbered `.life` file (`save_001.life`,
@@ -217,5 +246,6 @@ grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmet
 - Time-travel replay — 256-frame history ring buffer with rewind/fast-forward, timeline scrubber bar, and branching from any historical point
 - Save/load — binary `.life` files preserving full state (grid, zones, emitters, absorbers, settings) with auto-numbered slots and status flash feedback
 - Frequency analysis — per-cell oscillation period detection via autocorrelation over timeline history, with ice-blue→emerald→gold→red color spectrum and legend overlay
+- Wormhole portals — paired non-local spatial couplings with additive neighbor model, animated ring visualization, positional offset mapping, and bidirectional coupling across up to 8 portal pairs
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)
