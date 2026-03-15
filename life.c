@@ -68,6 +68,9 @@
  *   ^           Toggle Kolmogorov complexity estimator (algorithmic complexity)
  *                 LZ77-style compression of local neighborhoods
  *                 Blue=compressible, gold=structured, red=incompressible
+ *   ?           Toggle cell probe inspector (click any cell for all metrics)
+ *                 Shows entropy, temperature, Lyapunov, Fourier, fractal, surprisal,
+ *                 mutual info, Kolmogorov, complexity, frequency, flow, RG, topology
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -465,6 +468,13 @@ static float kc_hist_mean[KC_HIST_LEN];
 static float kc_hist_max[KC_HIST_LEN];
 static int   kc_hist_idx = 0;
 static int   kc_hist_count = 0;
+
+/* ── Cell Probe Inspector ─────────────────────────────────────────────────── */
+/* Click-to-inspect tool: shows all analysis metrics for a single cell.
+   Toggle with '?' key, then click any cell to display its full diagnostic. */
+static int   probe_mode = 0;          /* 0=off, 1=on (awaiting click), 2=showing */
+static int   probe_x = -1;            /* selected cell x */
+static int   probe_y = -1;            /* selected cell y */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -6723,6 +6733,15 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(kc_str, sizeof(kc_str),
                  " \033[38;2;240;180;40m\xe2\x97\x86KC:%.2f\033[0m", kc_global_mean);
 
+    /* Probe mode indicator */
+    char probe_str[96] = "";
+    if (probe_mode == 1)
+        snprintf(probe_str, sizeof(probe_str),
+                 " \033[38;2;0;220;180m\xe2\x97\x86PROBE:click\033[0m");
+    else if (probe_mode == 2)
+        snprintf(probe_str, sizeof(probe_str),
+                 " \033[38;2;0;220;180m\xe2\x97\x86PROBE:(%d,%d)\033[0m", probe_x, probe_y);
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -6843,9 +6862,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -6871,7 +6890,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
                      "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
-                     "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
+                     "[S]stamp [v]census [?]probe [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
@@ -9245,6 +9264,378 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", krst);
     }
 
+    /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
+    if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
+        int pp_w = 48;
+        int pp_h = 28; /* total rows including borders */
+        /* Center panel vertically, place on left side to avoid overlay panel stacking on right */
+        int pp_col = 2;
+        int pp_row = 3;
+        if (pp_col < 1) pp_col = 1;
+
+        const char *pbdr = "\033[38;2;0;220;180;48;2;6;16;14m";
+        const char *pbg  = "\033[48;2;6;16;14m";
+        const char *prst = "\033[0m";
+        const char *plbl = "\033[38;2;0;180;150m";   /* label color (teal) */
+        const char *pval = "\033[38;2;255;255;255m";  /* value color (white) */
+        const char *pdim = "\033[38;2;80;120;110m";   /* dim color */
+
+        int px = probe_x, py = probe_y;
+        int row = 0;
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Cell Probe \xe2\x97\x86 (%d,%d) ",
+                     pp_row, pp_col, pbdr, px, py);
+        { int used = 20 + (px >= 100 ? 3 : px >= 10 ? 2 : 1) + (py >= 100 ? 3 : py >= 10 ? 2 : 1);
+          for (int i = used; i < pp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; } }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", prst);
+        row++;
+
+        /* Helper macro for a row: label + value */
+        #define PROBE_ROW_START() do { \
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", \
+                         pp_row + row, pp_col, pbdr, pbg); \
+        } while(0)
+        #define PROBE_ROW_END() do { \
+            p += sprintf(p, "%s\xe2\x94\x82%s", pbdr, prst); \
+            row++; \
+        } while(0)
+        #define PROBE_PAD(used) do { \
+            for (int _i = (used); _i < pp_w - 1; _i++) *p++ = ' '; \
+        } while(0)
+
+        /* Row 1: State, Age, Species */
+        PROBE_ROW_START();
+        {
+            int age = grid[py][px];
+            int sp = species[py][px];
+            const char *state_str = age > 0 ? "\033[38;2;80;255;120mALIVE" : "\033[38;2;120;120;120mDEAD";
+            p += sprintf(p, " %sState:%s %s", plbl, prst, state_str);
+            p += sprintf(p, " %s Age:%s%d", plbl, pval, age);
+            if (ecosystem_mode) {
+                const char *sp_str = sp == 1 ? "\033[38;2;60;120;255mA" :
+                                     sp == 2 ? "\033[38;2;255;80;40mB" : "\033[38;2;120;120;120m-";
+                p += sprintf(p, " %sSp:%s%s", plbl, prst, sp_str);
+            }
+            PROBE_PAD(30);
+        }
+        PROBE_ROW_END();
+
+        /* Row 2: Zone rule */
+        PROBE_ROW_START();
+        {
+            int z = zone[py][px];
+            p += sprintf(p, " %sZone:%s %d %s(%s)%s", plbl, pval, z, pdim, rulesets[z % N_RULESETS].name, prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(28);
+        }
+        PROBE_ROW_END();
+
+        /* Row 3: Neighborhood (Moore 3x3) */
+        PROBE_ROW_START();
+        {
+            p += sprintf(p, " %sNeighbors:%s ", plbl, pval);
+            int alive_n = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = px + dx, ny = py + dy;
+                    if (nx >= 0 && nx < W && ny >= 0 && ny < H && grid[ny][nx] > 0)
+                        alive_n++;
+                }
+            /* Show 3x3 mini grid */
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int nx = px + dx, ny = py + dy;
+                    int alive = (nx >= 0 && nx < W && ny >= 0 && ny < H && grid[ny][nx] > 0);
+                    if (dx == 0 && dy == 0)
+                        p += sprintf(p, "%s", alive ? "\033[38;2;255;255;0m\xe2\x96\xa3" : "\033[38;2;255;255;0m\xe2\x96\xa2");
+                    else
+                        p += sprintf(p, "%s", alive ? "\033[38;2;180;220;180m\xe2\x96\xa3" : "\033[38;2;40;50;40m\xe2\x96\xa2");
+                }
+                if (dy < 1) *p++ = ' ';
+            }
+            p += sprintf(p, " %s(%d/8)%s", pdim, alive_n, prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(33);
+        }
+        PROBE_ROW_END();
+
+        /* Row 4: separator */
+        PROBE_ROW_START();
+        p += sprintf(p, " %s", pdim);
+        for (int i = 0; i < pp_w - 3; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, " ");
+        PROBE_ROW_END();
+
+        /* Row 5: Entropy */
+        PROBE_ROW_START();
+        {
+            float e = entropy_grid[py][px];
+            p += sprintf(p, " %sEntropy:%s     ", plbl, prst);
+            if (e < 0.3f) p += sprintf(p, "\033[38;2;40;80;200m");
+            else if (e < 0.7f) p += sprintf(p, "\033[38;2;200;200;40m");
+            else p += sprintf(p, "\033[38;2;240;60;40m");
+            p += sprintf(p, "%.4f", e);
+            p += sprintf(p, " %sbits%s", pdim, prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(28);
+        }
+        PROBE_ROW_END();
+
+        /* Row 6: Temperature */
+        PROBE_ROW_START();
+        {
+            float t = temp_grid[py][px] + temp_global;
+            p += sprintf(p, " %sTemperature:%s ", plbl, prst);
+            if (t < 0.1f) p += sprintf(p, "\033[38;2;60;120;220m");
+            else if (t < 0.5f) p += sprintf(p, "\033[38;2;220;180;40m");
+            else p += sprintf(p, "\033[38;2;240;60;40m");
+            p += sprintf(p, "%.4f", t);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(28);
+        }
+        PROBE_ROW_END();
+
+        /* Row 7: Lyapunov */
+        PROBE_ROW_START();
+        {
+            float ly = lyapunov_grid[py][px];
+            p += sprintf(p, " %sLyapunov:%s    ", plbl, prst);
+            if (ly < 0.3f) p += sprintf(p, "\033[38;2;40;80;200m");
+            else if (ly < 0.6f) p += sprintf(p, "\033[38;2;200;200;40m");
+            else p += sprintf(p, "\033[38;2;240;60;40m");
+            p += sprintf(p, "%.4f", ly);
+            p += sprintf(p, " %s%s%s", pdim, ly > 0.5f ? "chaotic" : ly > 0.2f ? "critical" : "stable", prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(32);
+        }
+        PROBE_ROW_END();
+
+        /* Row 8: Fourier power */
+        PROBE_ROW_START();
+        {
+            float fp = fourier_grid[py][px];
+            p += sprintf(p, " %sFourier:%s     ", plbl, prst);
+            if (fp < 0.3f) p += sprintf(p, "\033[38;2;20;40;80m");
+            else if (fp < 0.7f) p += sprintf(p, "\033[38;2;40;120;200m");
+            else p += sprintf(p, "\033[38;2;220;240;255m");
+            p += sprintf(p, "%.4f", fp);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(28);
+        }
+        PROBE_ROW_END();
+
+        /* Row 9: Fractal dimension */
+        PROBE_ROW_START();
+        {
+            float fr = fractal_grid[py][px];
+            p += sprintf(p, " %sFractal:%s     ", plbl, prst);
+            if (fr < 0.3f) p += sprintf(p, "\033[38;2;40;80;40m");
+            else if (fr < 0.7f) p += sprintf(p, "\033[38;2;200;200;40m");
+            else p += sprintf(p, "\033[38;2;240;60;220m");
+            p += sprintf(p, "%.4f", fr);
+            p += sprintf(p, " %s%s%s", pdim, fr > 0.7f ? "fine" : fr > 0.3f ? "meso" : "coarse", prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(32);
+        }
+        PROBE_ROW_END();
+
+        /* Row 10: Surprisal */
+        PROBE_ROW_START();
+        {
+            float s = surp_grid[py][px];
+            p += sprintf(p, " %sSurprisal:%s   ", plbl, prst);
+            if (s < 0.3f) p += sprintf(p, "\033[38;2;40;60;120m");
+            else if (s < 0.8f) p += sprintf(p, "\033[38;2;200;150;40m");
+            else p += sprintf(p, "\033[38;2;255;80;40m");
+            p += sprintf(p, "%.4f", s);
+            p += sprintf(p, " %sbits%s", pdim, prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(30);
+        }
+        PROBE_ROW_END();
+
+        /* Row 11: Mutual Information */
+        PROBE_ROW_START();
+        {
+            float mi = mi_overlay[py][px];
+            p += sprintf(p, " %sMutual Info:%s ", plbl, prst);
+            p += sprintf(p, "\033[38;2;60;200;160m%.4f", mi);
+            p += sprintf(p, " %sbits%s", pdim, prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(30);
+        }
+        PROBE_ROW_END();
+
+        /* Row 12: Kolmogorov complexity */
+        PROBE_ROW_START();
+        {
+            float k = kc_grid[py][px];
+            p += sprintf(p, " %sKolmogorov:%s  ", plbl, prst);
+            if (k < 0.3f) p += sprintf(p, "\033[38;2;60;160;220m");
+            else if (k < 0.7f) p += sprintf(p, "\033[38;2;240;200;40m");
+            else p += sprintf(p, "\033[38;2;240;80;60m");
+            p += sprintf(p, "%.4f", k);
+            p += sprintf(p, " %s%s%s", pdim, k > 0.7f ? "incompress" : k > 0.3f ? "structured" : "simple", prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(34);
+        }
+        PROBE_ROW_END();
+
+        /* Row 13: Composite complexity */
+        PROBE_ROW_START();
+        {
+            float c = cplx_grid[py][px];
+            p += sprintf(p, " %sComplexity:%s  ", plbl, prst);
+            if (c < 0.2f) p += sprintf(p, "\033[38;2;40;40;40m");
+            else if (c < 0.5f) p += sprintf(p, "\033[38;2;40;180;40m");
+            else if (c < 0.7f) p += sprintf(p, "\033[38;2;240;200;40m");
+            else p += sprintf(p, "\033[38;2;240;60;40m");
+            p += sprintf(p, "%.4f", c);
+            p += sprintf(p, " %s%s%s", pdim,
+                         c > 0.7f ? "chaotic" : c > 0.4f ? "edge-of-chaos" : c > 0.1f ? "periodic" : "dead", prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(36);
+        }
+        PROBE_ROW_END();
+
+        /* Row 14: separator */
+        PROBE_ROW_START();
+        p += sprintf(p, " %s", pdim);
+        for (int i = 0; i < pp_w - 3; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, " ");
+        PROBE_ROW_END();
+
+        /* Row 15: Frequency / oscillation period */
+        PROBE_ROW_START();
+        {
+            int fq = freq_grid[py][px];
+            p += sprintf(p, " %sFrequency:%s   ", plbl, prst);
+            if (fq == 0) p += sprintf(p, "\033[38;2;120;120;120mdead");
+            else if (fq == 1) p += sprintf(p, "\033[38;2;60;60;200mstill life");
+            else if (fq == 255) p += sprintf(p, "\033[38;2;240;60;40mchaotic");
+            else p += sprintf(p, "\033[38;2;40;200;200mperiod %d", fq);
+            p += sprintf(p, "%s%s", pbg, prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(28);
+        }
+        PROBE_ROW_END();
+
+        /* Row 16: Information flow */
+        PROBE_ROW_START();
+        {
+            float fmag = flow_mag[py][px];
+            float fvx = flow_vx[py][px];
+            float fvy = flow_vy[py][px];
+            p += sprintf(p, " %sInfo Flow:%s   ", plbl, prst);
+            p += sprintf(p, "\033[38;2;160;220;255m%.3f", fmag);
+            /* Direction arrow */
+            const char *arrows[] = {"\xe2\x86\x91","\xe2\x86\x97","\xe2\x86\x92","\xe2\x86\x98",
+                                    "\xe2\x86\x93","\xe2\x86\x99","\xe2\x86\x90","\xe2\x86\x96"};
+            if (fmag > 0.01f) {
+                float angle = atan2f(-fvy, fvx);
+                int dir = ((int)(angle * 4.0f / 3.14159f + 8.5f)) % 8;
+                p += sprintf(p, " %s", arrows[dir]);
+            }
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(28);
+        }
+        PROBE_ROW_END();
+
+        /* Row 17: RG scale */
+        PROBE_ROW_START();
+        {
+            float rg = rg_grid[py][px];
+            float ri = rg_invariance[py][px];
+            p += sprintf(p, " %sRG Scale:%s    ", plbl, prst);
+            if (ri > 0.7f) p += sprintf(p, "\033[38;2;220;220;220m");
+            else if (rg < 0.33f) p += sprintf(p, "\033[38;2;40;220;220m");
+            else if (rg < 0.66f) p += sprintf(p, "\033[38;2;220;220;40m");
+            else p += sprintf(p, "\033[38;2;220;40;220m");
+            p += sprintf(p, "%.3f", rg);
+            p += sprintf(p, " %sInvar:%s", pdim, prst);
+            p += sprintf(p, "\033[38;2;200;200;200m%.3f", ri);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(32);
+        }
+        PROBE_ROW_END();
+
+        /* Row 18: Topological info */
+        PROBE_ROW_START();
+        {
+            unsigned short lbl = topo_label[py][px];
+            int hole = topo_hole[py][px];
+            p += sprintf(p, " %sTopo:%s        ", plbl, prst);
+            if (lbl > 0) {
+                p += sprintf(p, "\033[38;2;120;220;180mcomp #%d", lbl);
+                if (lbl < TOPO_MAX_COMPONENTS)
+                    p += sprintf(p, " %s(size %d)%s", pdim, topo_comp_size[lbl], prst);
+            } else {
+                p += sprintf(p, "\033[38;2;120;120;120mnone");
+            }
+            if (hole)
+                p += sprintf(p, " \033[38;2;200;80;220mHOLE");
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(34);
+        }
+        PROBE_ROW_END();
+
+        /* Row 19: Causal cone info */
+        PROBE_ROW_START();
+        {
+            int cb = cone_back[py][px];
+            int cf = cone_fwd[py][px];
+            p += sprintf(p, " %sCausal:%s      ", plbl, prst);
+            if (cb > 0) p += sprintf(p, "\033[38;2;255;180;60mback:%d ", cb - 1);
+            else p += sprintf(p, "%sback:- ", pdim);
+            if (cf > 0) p += sprintf(p, "\033[38;2;80;200;255mfwd:%d", cf - 1);
+            else p += sprintf(p, "%sfwd:-", pdim);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(28);
+        }
+        PROBE_ROW_END();
+
+        /* Row 20: Ghost / tracer */
+        PROBE_ROW_START();
+        {
+            int gh = ghost[py][px];
+            int tr = tracer[py][px];
+            p += sprintf(p, " %sGhost:%s       ", plbl, prst);
+            p += sprintf(p, "\033[38;2;180;180;200m%d", gh);
+            p += sprintf(p, "  %sTracer:%s ", plbl, prst);
+            p += sprintf(p, "\033[38;2;180;180;200m%d", tr);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(26);
+        }
+        PROBE_ROW_END();
+
+        /* Row 21: separator */
+        PROBE_ROW_START();
+        p += sprintf(p, " %s", pdim);
+        for (int i = 0; i < pp_w - 3; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, " ");
+        PROBE_ROW_END();
+
+        /* Row 22: hint */
+        PROBE_ROW_START();
+        p += sprintf(p, " %s[?]close  L-click:retarget R:dismiss%s", pdim, prst);
+        p += sprintf(p, "%s", pbg);
+        PROBE_PAD(33);
+        PROBE_ROW_END();
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", pp_row + row, pp_col, pbdr);
+        for (int i = 0; i < pp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", prst);
+
+        #undef PROBE_ROW_START
+        #undef PROBE_ROW_END
+        #undef PROBE_PAD
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -9783,6 +10174,16 @@ int main(int argc, char **argv) {
                 kc_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '?') {
+            if (probe_mode > 0) {
+                probe_mode = 0; /* toggle off */
+                probe_x = probe_y = -1;
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                probe_mode = 1; /* waiting for click */
+                flash_set("Probe: click a cell to inspect");
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -10023,7 +10424,22 @@ int main(int argc, char **argv) {
                     gy = view_y + (m->y - 3) * 4;
                 }
 
-                if (cone_mode >= 1 && m->type == 1 && (btn & 0x03) == 0) {
+                if (probe_mode >= 1 && m->type == 1 && (btn & 0x03) == 0) {
+                    /* Cell probe: left-click selects target cell for inspection */
+                    if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
+                        probe_x = gx;
+                        probe_y = gy;
+                        probe_mode = 2;
+                        char msg[64];
+                        snprintf(msg, sizeof(msg), "Probe: (%d,%d)", gx, gy);
+                        flash_set(msg);
+                    }
+                } else if (probe_mode >= 1 && m->type == 1 && (btn & 0x03) == 2) {
+                    /* Cell probe: right-click dismisses probe */
+                    probe_mode = 0;
+                    probe_x = probe_y = -1;
+                    printf("\033[2J"); fflush(stdout);
+                } else if (cone_mode >= 1 && m->type == 1 && (btn & 0x03) == 0) {
                     /* Light cone: left-click selects target cell */
                     if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
                         cone_sel_x = gx;
