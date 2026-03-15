@@ -32,6 +32,11 @@ Requires only `gcc` and a POSIX terminal.
 | `k` | Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope) |
 | `z` / `x` | Zoom in / out (1x → 2x half-block → 4x quarter-block) |
 | `n` | Toggle minimap overlay (full-grid thumbnail + viewport rect) |
+| `e` | Cycle emitter/absorber mode (off → emitter → absorber) |
+| `[` / `]` | Cycle emitter pattern or absorber radius |
+| `<` / `,` | Rewind through history (enters replay mode) |
+| `>` / `.` | Fast-forward through history |
+| `t` | Toggle timeline scrubber bar |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |
 | `0` | Re-center viewport |
 | `1`–`5` | Load preset pattern |
@@ -91,6 +96,36 @@ Try painting Conway on the left and Maze on the right, then randomize — watch
 gliders from Conway crash into maze corridors! Or use preset `3` (concentric rings)
 for a psychedelic multi-rule target pattern.
 
+## Emitters & Absorbers
+
+Press `e` to cycle through **emitter** and **absorber** placement modes. These transform
+the automaton from a closed system into an open dissipative one with steady-state flows.
+
+- **Emitters** — point sources that spawn cells at configurable intervals. Four patterns:
+  dot, cross, random 3×3, and glider (auto-varies direction by position).
+- **Absorbers** — circular kill zones that continuously remove all cells within radius.
+  Scroll wheel adjusts radius (1–10 cells).
+
+Place emitters on one side and absorbers on the other to create rivers of cells.
+Combine with multi-rule zones for complex flow interactions at rule boundaries.
+
+## Time-Travel Replay
+
+The simulation automatically records every generation into a 256-frame history ring buffer.
+
+| Key | Action |
+|-----|--------|
+| `<` / `,` | Rewind (enters replay mode) |
+| `>` / `.` | Fast-forward |
+| `s` | Step forward one frame in replay |
+| `SPACE` | Resume live simulation from current point (**branch**) |
+| `t` | Toggle timeline scrubber bar |
+
+The status bar shows `⏪ REPLAY` when browsing history. The timeline scrubber displays a
+playhead (`●`) showing your position. Pressing SPACE at any point **branches** — it restores
+that historical state, truncates the future, and resumes live simulation from there. This
+lets you rewind to a critical moment, change parameters, and compare outcomes.
+
 ## Implementation Details
 
 - Double-buffered grid updates for correct neighbor counting
@@ -106,5 +141,7 @@ for a psychedelic multi-rule target pattern.
 - Multi-rule zones — paint different rulesets onto regions; cells use per-zone rules with emergent boundary interactions
 - Zoom and pan — 3 zoom levels using Unicode half-block (▀▄) and quarter-block (▘▝▖▗) characters for 2x and 4x density
 - Minimap overlay — quarter-block thumbnail of full grid with yellow viewport rectangle, auto-shows when zoomed
+- Emitters and absorbers — placeable cell sources (dot, cross, random, glider patterns) and circular kill zones for open dissipative dynamics
+- Time-travel replay — 256-frame history ring buffer with rewind/fast-forward, timeline scrubber bar, and branching from any historical point
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)
