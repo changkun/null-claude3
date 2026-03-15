@@ -56,6 +56,7 @@ Requires only `gcc` and a POSIX terminal.
 | `A` | Toggle phase-space attractor (Takens delay embedding portrait) |
 | `9` | Toggle causal light cone — click cell to trace backward/forward cones |
 | `!` | Toggle prediction surprise field (per-cell transition surprisal heatmap) |
+| `@` | Toggle mutual information network (inter-region coupling map) |
 | `+`/`-` (in cone) | Adjust forward cone depth |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
@@ -420,6 +421,27 @@ The overlay panel shows mean/max surprisal in bits, plus counts of predictable (
 
 High-entropy regions aren't necessarily surprising (random noise is high-entropy but predictable *as noise*). Surprise reveals where a specific outcome defied the learned distribution — the true frontier of unpredictability.
 
+### Mutual Information Network
+
+Toggle with `@`. Partitions the grid into a **20×10 coarse block grid** (20×20 cells per block, 200 blocks total) and computes **mutual information** between all block-pair population time series over the 256-frame history buffer, revealing mesoscale coupling structure invisible to single-cell analyzers.
+
+For each block pair, populations are quantized into 8 bins and MI is computed as:
+`MI(X;Y) = Σ p(x,y) log₂(p(x,y) / (p(x)·p(y)))`
+
+The top-40 strongest couplings are rendered as **Bresenham lines** between block centers, colored by coupling strength:
+- **Dark blue**: weak coupling — low mutual information
+- **Cyan → green**: moderate coupling — partial synchronization
+- **Yellow → magenta → white**: strong coupling — tightly entrained regions
+
+The overlay panel displays max MI, mean MI, network density (fraction of pairs above 0.1-bit threshold), clustering coefficient of the coupling graph, and the top-5 strongest couplings with block coordinates.
+
+**What it reveals vs other analyzers:**
+- **Entropy/Lyapunov/Surprise** examine individual cells or local neighborhoods
+- **Information flow** tracks directed causal influence between adjacent cells
+- **MI Network** reveals **long-range synchronization** — how distant regions co-vary over time, exposing oscillator entrainment, glider communication channels, and emergent mesoscale structure
+
+Recomputes every 8 generations while running. Requires ≥16 frames of history for meaningful results.
+
 ## Implementation Details
 
 - Double-buffered grid updates for correct neighbor counting
@@ -443,6 +465,7 @@ High-entropy regions aren't necessarily surprising (random noise is high-entropy
 - Screenshot capture — single-frame PPM export via `cell_color()` pipeline, plus full timeline sequence dump with grid state save/restore, auto-numbered filenames up to 9999
 - Pattern stamp tool — 20 classic patterns across 5 categories with pre-computed rotations, preview overlay, and full integration with symmetry/species/zones
 - Live pattern census — real-time structure recognition via bitmask matching with dead-border verification for 14 pattern templates (8 still lifes + 6 oscillator phases), color-coded overlay panel, unclaimed cell tracking, and 16-generation refresh cycle
+- Mutual information network — inter-region coupling map partitioning grid into 20×10 blocks, computing MI for all ~20K block pairs over 256-frame history, Bresenham line rendering of top-40 couplings, clustering coefficient, and 8-generation refresh cycle
 - Dual-species ecosystem — two coexisting cell populations with independent B/S rules, species-aware neighbor counting, configurable interaction coefficient (-1.0 hostile to +1.0 cooperative), species-specific color gradients, and birth arbitration
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)
