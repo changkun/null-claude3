@@ -29,6 +29,7 @@
  *   t           Toggle timeline bar display
  *   T           Cycle signal tracer: off → accumulate → frozen → clear+off
  *   f           Toggle frequency analysis overlay (period detection heatmap)
+ *   i           Toggle entropy heatmap overlay (local Shannon entropy)
  *   W           Toggle wormhole portal placement (left=entrance, right=exit, middle=remove)
  *                 Paired portals create non-local neighbor coupling
  *   v           Toggle pattern census overlay (counts known structures)
@@ -93,6 +94,16 @@ static int tracer_mode = 0; /* 0=off, 1=accumulating, 2=frozen (visible but not 
 static unsigned char freq_grid[MAX_H][MAX_W]; /* 0=dead, 1=still life, 2-32=period, 255=chaotic */
 static int freq_mode = 0; /* 0=off, 1=on (analysis overlay active) */
 static int freq_stale = 1; /* 1=needs recomputation */
+
+/* ── Entropy Heatmap ─────────────────────────────────────────────────────── */
+/* Shannon entropy computed over each cell's Moore neighborhood (3x3 → 9 cells).
+   Measures local spatial information content: low entropy = uniform (all alive
+   or all dead), high entropy = mixed (edge of structures, phase boundaries). */
+static float entropy_grid[MAX_H][MAX_W]; /* 0.0 = uniform, 1.0 = max entropy */
+static int entropy_mode = 0;    /* 0=off, 1=on */
+static int entropy_stale = 1;   /* 1=needs recomputation */
+static float entropy_global = 0.0f;    /* mean entropy across grid */
+static float entropy_max_local = 0.0f; /* max local entropy found */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -947,6 +958,7 @@ static void grid_step(void) {
     timeline_push();
     freq_stale = 1;
     census_stale = 1;
+    entropy_stale = 1;
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -2097,6 +2109,73 @@ static void freq_analyze(void) {
         }
     }
     freq_stale = 0;
+}
+
+/* ── Entropy Heatmap computation ──────────────────────────────────────────── */
+
+/* Compute Shannon entropy for each cell's 3x3 Moore neighborhood.
+   H = -p*log2(p) - (1-p)*log2(1-p) where p = fraction of alive neighbors.
+   Result is 0.0 (all same) to 1.0 (half alive, half dead). */
+static void entropy_compute(void) {
+    double sum = 0.0;
+    float mx = 0.0f;
+    int counted = 0;
+    static const double log2_inv = 1.4426950408889634; /* 1/ln(2) */
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int alive = 0, total = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int nx = x + dx, ny = y + dy;
+                    if (!topo_map(&nx, &ny)) continue;
+                    total++;
+                    if (grid[ny][nx] > 0) alive++;
+                }
+            }
+            if (total == 0) {
+                entropy_grid[y][x] = 0.0f;
+                continue;
+            }
+            double p = (double)alive / (double)total;
+            double h;
+            if (p <= 0.0 || p >= 1.0)
+                h = 0.0;
+            else
+                h = -(p * log(p) + (1.0 - p) * log(1.0 - p)) * log2_inv;
+            entropy_grid[y][x] = (float)h;
+            sum += h;
+            if ((float)h > mx) mx = (float)h;
+            counted++;
+        }
+    }
+    entropy_global = counted > 0 ? (float)(sum / counted) : 0.0f;
+    entropy_max_local = mx;
+    entropy_stale = 0;
+}
+
+/* Map entropy value (0.0-1.0) to RGB:
+   green (low/ordered) → white (mid/boundary) → magenta (high/chaotic) */
+static RGB entropy_to_rgb(float h) {
+    if (h <= 0.0f) return (RGB){10, 30, 10};       /* near-black green */
+    if (h >= 1.0f) return (RGB){255, 40, 220};      /* hot magenta */
+    if (h < 0.5f) {
+        /* Green → white (0.0 → 0.5) */
+        float t = h * 2.0f;
+        return (RGB){
+            (unsigned char)(10 + t * 245),
+            (unsigned char)(80 + t * 175),
+            (unsigned char)(10 + t * 245)
+        };
+    } else {
+        /* White → magenta (0.5 → 1.0) */
+        float t = (h - 0.5f) * 2.0f;
+        return (RGB){
+            (unsigned char)(255),
+            (unsigned char)(255 - t * 215),
+            (unsigned char)(255 - t * 35)
+        };
+    }
 }
 
 /* ── Save / Load (.life files) ─────────────────────────────────────────────── */
@@ -3332,6 +3411,22 @@ static int cell_color(int x, int y, RGB *out) {
         return 0; /* truly dead — no period */
     }
 
+    /* Entropy heatmap overlay: color by local Shannon entropy */
+    if (entropy_mode) {
+        float h = entropy_grid[y][x];
+        if (h > 0.001f || grid[y][x]) {
+            *out = entropy_to_rgb(h);
+            /* Brighten alive cells for structure visibility */
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 8; /* 8 = entropy ghost */
+        }
+        return 0;
+    }
+
     /* Census spaceship overlay: cyan for detected moving structures */
     if (census_mode && grid[y][x] && census_ship[y][x]) {
         int age = grid[y][x];
@@ -3431,6 +3526,12 @@ static void render(int running, int speed_ms, int draw_mode) {
     if (freq_mode)
         snprintf(freq_str, sizeof(freq_str),
                  " \033[38;2;80;180;240m\u2261FREQ\033[0m");
+
+    /* Entropy indicator */
+    char entropy_str[96] = "";
+    if (entropy_mode)
+        snprintf(entropy_str, sizeof(entropy_str),
+                 " \033[38;2;180;255;180m\u2234ENT:%.3f\033[0m", entropy_global);
 
     /* Census indicator */
     char census_str[64] = "";
@@ -3537,9 +3638,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, census_str, gene_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, census_str, gene_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -3563,7 +3664,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq "
+                     "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent "
                      "[/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
@@ -4067,6 +4168,96 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rst2);
     }
 
+    /* ── Entropy Heatmap overlay panel ────────────────────────────────────── */
+    if (entropy_mode) {
+        int ent_w = 44;
+        int ent_col = term_cols - ent_w - 2;
+        int ent_row = 3;
+        if (ent_col < 1) ent_col = 1;
+
+        const char *ebdr = "\033[38;2;120;255;160;48;2;8;16;8m";
+        const char *ebg  = "\033[48;2;8;16;8m";
+        const char *erst  = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Entropy Map ",
+                     ent_row, ent_col, ebdr);
+        for (int i = 14; i < ent_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", erst);
+
+        /* Stats row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ent_row + 1, ent_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;120;255;160mH\xcc\x84=\033[38;2;255;255;255m%.4f"
+                     "  \033[38;2;120;255;160mH\xe2\x82\x98\xe2\x82\x90\xe2\x82\x93=\033[38;2;255;255;255m%.4f",
+                     entropy_global, entropy_max_local);
+        /* Pad */
+        p += sprintf(p, "%s", ebg);
+        for (int i = 0; i < 8; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Distribution histogram: bin entropy into 10 buckets, show as bar */
+        int bins[10] = {0};
+        int total_cells = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                float h = entropy_grid[y][x];
+                int b = (int)(h * 9.99f);
+                if (b < 0) b = 0;
+                if (b > 9) b = 9;
+                bins[b]++;
+                total_cells++;
+            }
+        int bmax = 1;
+        for (int i = 0; i < 10; i++)
+            if (bins[i] > bmax) bmax = bins[i];
+
+        /* Label row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ent_row + 2, ent_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;80;120;80m0.0");
+        for (int i = 0; i < 24; i++) *p++ = ' ';
+        p += sprintf(p, "\033[38;2;80;120;80mEntropy");
+        for (int i = 0; i < 4; i++) *p++ = ' ';
+        p += sprintf(p, "1.0 ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* 4 rows of histogram bars */
+        for (int row = 0; row < 4; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                         ent_row + 3 + row, ent_col, ebdr, ebg);
+            int level = 3 - row; /* top=3, bottom=0 */
+            for (int b = 0; b < 10; b++) {
+                int bar_h = bins[b] * 4 / bmax;
+                /* Each bin gets 4 chars wide */
+                for (int c = 0; c < 4; c++) {
+                    if (bar_h > level) {
+                        /* Color by bin position: green → white → magenta */
+                        RGB bc = entropy_to_rgb((float)b / 9.0f);
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88",
+                                     bc.r, bc.g, bc.b);
+                    } else if (bar_h == level) {
+                        RGB bc = entropy_to_rgb((float)b / 9.0f);
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84",
+                                     bc.r/2, bc.g/2, bc.b/2);
+                    } else {
+                        p += sprintf(p, "\033[38;2;15;25;15m\xc2\xb7");
+                    }
+                }
+            }
+            /* Pad remaining */
+            *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+        }
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", ent_row + 7, ent_col, ebdr);
+        for (int i = 0; i < ent_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", erst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -4502,6 +4693,12 @@ int main(int argc, char **argv) {
                 freq_analyze(); /* compute on toggle-on */
             }
         }
+        else if (key == 'i' || key == 'I') {
+            entropy_mode = !entropy_mode;
+            if (entropy_mode) {
+                entropy_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (stamp_mode) {
                 stamp_sel = (stamp_sel + 1) % N_STAMPS;
@@ -4830,6 +5027,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh frequency analysis every 8 generations when active */
         if (freq_mode && freq_stale && (generation % 8 == 0 || !running)) {
             freq_analyze();
+        }
+
+        /* Auto-refresh entropy heatmap every 4 generations when active */
+        if (entropy_mode && entropy_stale && (generation % 4 == 0 || !running)) {
+            entropy_compute();
         }
 
         /* Auto-refresh census every 16 generations when active (heavier scan) */
