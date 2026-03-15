@@ -21,9 +21,19 @@ Requires only `gcc` and a POSIX terminal.
 | `s` | Step one generation (while paused) |
 | `r` | Randomize grid |
 | `c` | Clear grid |
+| `w` | Toggle toroidal wrapping (∞ indicator) |
+| `d` | Toggle draw mode (mouse painting) |
+| `g` | Toggle population sparkline graph |
 | `1`–`5` | Load preset pattern |
 | `+` / `-` | Speed up / slow down (20ms–1000ms) |
 | `q` / `ESC` | Quit |
+
+### Mouse (draw mode)
+
+| Action | Effect |
+|--------|--------|
+| Left-click / drag | Place cells |
+| Right-click / drag | Erase cells |
 
 ## Preset Patterns
 
@@ -39,4 +49,7 @@ Requires only `gcc` and a POSIX terminal.
 - Single-write rendering via pre-built output buffer (~60fps)
 - SIGWINCH handler for live terminal resize
 - Color-cycling alive cells (6-color palette)
+- SGR extended mouse protocol (1006) for large terminal support
+- Population sparkline using Unicode block elements (▁▂▃▅▇█) with red→yellow→green color gradient
+- Toroidal wrapping mode — gliders and patterns loop around edges
 - Proper terminal cleanup on exit (raw mode restore, cursor show)
