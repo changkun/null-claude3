@@ -56,6 +56,7 @@
  *   A           Toggle phase-space attractor (Takens delay embedding portrait)
  *   9           Toggle causal light cone (click cell to trace backward/forward cones)
  *                 +/- adjust forward cone depth, click to retarget
+ *   !           Toggle prediction surprise field (per-cell surprisal heatmap)
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -274,6 +275,41 @@ static int   cone_theoretical = 0;   /* theoretical max cells in cone */
 static float cone_fill_ratio = 0.0f; /* actual/theoretical ratio */
 static int   cone_back_alive = 0;    /* backward cone cells currently alive */
 
+/* ── Prediction Surprise Field ─────────────────────────────────────────── */
+/* Per-cell surprisal: accumulate transition statistics (neighborhood config →
+   outcome) over a sliding window, then color each cell by -log₂ P(state|nbrs).
+   Predictable regions (still lifes, known oscillators) render cool/dark;
+   unpredictable boundaries and chaotic zones glow hot. */
+#define SURP_WINDOW 32      /* frames of transition history to track */
+#define SURP_HASH_SIZE 8192 /* hash table size for transition counts (power of 2) */
+#define SURP_HASH_MASK (SURP_HASH_SIZE - 1)
+
+/* Hash table entry: maps (neighborhood_config, outcome) → count */
+typedef struct {
+    unsigned int key;   /* packed neighborhood config (9 bits for Moore nbrs + 1 bit center state) */
+    int outcome;        /* 0 or 1: what the center cell became */
+    int count;          /* transition count */
+    int total;          /* total times this neighborhood config was seen */
+} SurpEntry;
+
+static float surp_grid[MAX_H][MAX_W];   /* per-cell surprisal (bits) */
+static int   surp_mode = 0;             /* 0=off, 1=on */
+static int   surp_stale = 1;            /* 1=needs recomputation */
+static float surp_global = 0.0f;        /* mean surprisal across grid */
+static float surp_max_local = 0.0f;     /* max local surprisal */
+static float surp_min_local = 99.0f;    /* min non-zero surprisal */
+static int   surp_predictable = 0;      /* cells with surprisal < 0.1 bits */
+static int   surp_surprising = 0;       /* cells with surprisal > 0.8 bits */
+
+/* Ring buffer of recent grids for transition statistics */
+static unsigned char surp_history[SURP_WINDOW][MAX_H][MAX_W];
+static int surp_hist_head = 0;          /* next write position */
+static int surp_hist_len = 0;           /* filled entries */
+
+/* Hash table for transition frequency counting */
+static int surp_trans_count[SURP_HASH_SIZE];  /* count of (config → alive) */
+static int surp_trans_total[SURP_HASH_SIZE];  /* total count of config */
+
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
 static int census_stale = 1;   /* 1=needs recomputation */
@@ -416,6 +452,9 @@ static void census_ship_scan(void);
 
 /* Forward declaration — defined after grid_step where H/W/topology are available */
 static void census_scan(void);
+
+/* Forward declaration for surprise field */
+static void surp_record_frame(void);
 
 /* ── Genetic Rule Explorer ────────────────────────────────────────────────── */
 #define GENPOP_SIZE 20       /* population of candidate rules per generation */
@@ -1150,6 +1189,10 @@ static void grid_step(void) {
     wolfram_stale = 1;
     flow_stale = 1;
     attractor_stale = 1;
+    surp_stale = 1;
+
+    /* Always record frames for surprise field (cheap memcpy) */
+    surp_record_frame();
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -3634,6 +3677,167 @@ static void cone_compute(void) {
     cone_mode = 2; /* mark as computed */
 }
 
+/* ── Prediction Surprise Field computation ────────────────────────────────── */
+/* Record current grid into surprise history ring buffer */
+static void surp_record_frame(void) {
+    memcpy(surp_history[surp_hist_head], grid, sizeof(grid));
+    surp_hist_head = (surp_hist_head + 1) % SURP_WINDOW;
+    if (surp_hist_len < SURP_WINDOW) surp_hist_len++;
+}
+
+/* Compute neighborhood configuration hash for cell (x,y) in a grid snapshot */
+static unsigned int surp_nbr_hash(const unsigned char g[MAX_H][MAX_W], int x, int y) {
+    unsigned int h = 0;
+    int bit = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= W || ny < 0 || ny >= H) {
+                /* out of bounds = dead */
+            } else if (g[ny][nx] > 0) {
+                h |= (1u << bit);
+            }
+            bit++;
+        }
+    }
+    return h; /* 9 bits: bit0..8 = Moore neighborhood including center */
+}
+
+static void surp_compute(void) {
+    if (surp_hist_len < 3) {
+        /* Not enough history yet */
+        memset(surp_grid, 0, sizeof(surp_grid));
+        surp_global = 0.0f;
+        surp_max_local = 0.0f;
+        surp_stale = 0;
+        return;
+    }
+
+    /* Clear hash table */
+    memset(surp_trans_count, 0, sizeof(surp_trans_count));
+    memset(surp_trans_total, 0, sizeof(surp_trans_total));
+
+    /* Build transition statistics from history:
+       For each consecutive pair of frames, record (neighborhood_config → outcome) */
+    int n_pairs = surp_hist_len - 1;
+    /* Sample spatially: use 4x4 blocks for efficiency, then interpolate */
+    for (int fi = 0; fi < n_pairs; fi++) {
+        int idx_curr = (surp_hist_head - surp_hist_len + fi + SURP_WINDOW) % SURP_WINDOW;
+        int idx_next = (idx_curr + 1) % SURP_WINDOW;
+
+        /* Sample every 2nd cell for performance */
+        for (int y = 1; y < H - 1; y += 2) {
+            for (int x = 1; x < W - 1; x += 2) {
+                unsigned int cfg = surp_nbr_hash(surp_history[idx_curr], x, y);
+                int outcome = surp_history[idx_next][y][x] > 0 ? 1 : 0;
+
+                /* Hash: use cfg directly (9 bits = 512 possible configs) */
+                unsigned int slot = cfg & SURP_HASH_MASK;
+                surp_trans_total[slot]++;
+                if (outcome) surp_trans_count[slot]++;
+            }
+        }
+    }
+
+    /* Compute per-cell surprisal using current grid's neighborhood config */
+    static const float log2_inv = 1.4426950408889634f;
+    double sum = 0.0;
+    float mx = 0.0f, mn = 99.0f;
+    int counted = 0;
+    int n_pred = 0, n_surp = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            unsigned int cfg = surp_nbr_hash(grid, x, y);
+            unsigned int slot = cfg & SURP_HASH_MASK;
+            int total = surp_trans_total[slot];
+
+            if (total < 2) {
+                /* Unseen configuration — maximum uncertainty (1 bit) */
+                surp_grid[y][x] = 1.0f;
+                sum += 1.0;
+                if (1.0f > mx) mx = 1.0f;
+                counted++;
+                n_surp++;
+                continue;
+            }
+
+            /* P(alive | config) */
+            float p_alive = (float)surp_trans_count[slot] / (float)total;
+            int cell_alive = grid[y][x] > 0 ? 1 : 0;
+
+            /* P(actual outcome) */
+            float p_outcome = cell_alive ? p_alive : (1.0f - p_alive);
+
+            /* Clamp to avoid log(0) */
+            if (p_outcome < 0.001f) p_outcome = 0.001f;
+            if (p_outcome > 0.999f) p_outcome = 0.999f;
+
+            /* Surprisal = -log2(p_outcome) */
+            float s = -logf(p_outcome) * log2_inv;
+            if (s > 10.0f) s = 10.0f; /* cap at 10 bits */
+
+            surp_grid[y][x] = s;
+            sum += s;
+            if (s > mx) mx = s;
+            if (s < mn && s > 0.001f) mn = s;
+            if (s < 0.1f) n_pred++;
+            if (s > 0.8f) n_surp++;
+            counted++;
+        }
+    }
+
+    surp_global = counted > 0 ? (float)(sum / counted) : 0.0f;
+    surp_max_local = mx;
+    surp_min_local = mn < 99.0f ? mn : 0.0f;
+    surp_predictable = n_pred;
+    surp_surprising = n_surp;
+    surp_stale = 0;
+}
+
+/* Map surprisal (0..~10 bits) to RGB:
+   dark blue (predictable, ~0) → cyan (low surprise) → yellow (moderate) → red/white (high surprise) */
+static RGB surp_to_rgb(float s) {
+    /* Normalize: most surprisal values are 0-2 bits, scale accordingly */
+    float t = s / 2.0f; /* map 0-2 bits to 0-1 */
+    if (t > 1.0f) t = 1.0f;
+
+    if (t < 0.01f) return (RGB){5, 8, 20};           /* near-zero: dark */
+    if (t < 0.25f) {
+        /* Dark blue → cyan */
+        float u = t / 0.25f;
+        return (RGB){
+            (unsigned char)(10 + 10 * u),
+            (unsigned char)(20 + 180 * u),
+            (unsigned char)(80 + 175 * u)
+        };
+    } else if (t < 0.5f) {
+        /* Cyan → yellow */
+        float u = (t - 0.25f) / 0.25f;
+        return (RGB){
+            (unsigned char)(20 + 235 * u),
+            (unsigned char)(200 + 55 * u),
+            (unsigned char)(255 - 215 * u)
+        };
+    } else if (t < 0.75f) {
+        /* Yellow → red */
+        float u = (t - 0.5f) / 0.25f;
+        return (RGB){
+            (unsigned char)(255),
+            (unsigned char)(255 - 200 * u),
+            (unsigned char)(40 - 30 * u)
+        };
+    } else {
+        /* Red → hot white */
+        float u = (t - 0.75f) / 0.25f;
+        return (RGB){
+            (unsigned char)(255),
+            (unsigned char)(55 + 200 * u),
+            (unsigned char)(10 + 245 * u)
+        };
+    }
+}
+
 /* Map flow magnitude + direction to RGB color and Unicode arrow glyph */
 static RGB flow_to_rgb(float mag, float vx, float vy) {
     /* Normalize magnitude for color */
@@ -5167,6 +5371,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Prediction surprise field overlay: surprisal heatmap */
+    if (surp_mode) {
+        float s = surp_grid[y][x];
+        if (s > 0.005f || grid[y][x]) {
+            *out = surp_to_rgb(s);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 17; /* 17 = surprise ghost */
+        }
+        return 0;
+    }
+
     /* Temperature field overlay: show thermal landscape as blue→red wash */
     if (temp_mode) {
         float t = temp_global + temp_grid[y][x];
@@ -5356,6 +5575,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[38;2;200;140;60m\xe2\x97\x87" "CONE:(%d,%d)\033[0m",
                  cone_sel_x, cone_sel_y);
 
+    /* Surprise field indicator */
+    char surp_str[96] = "";
+    if (surp_mode)
+        snprintf(surp_str, sizeof(surp_str),
+                 " \033[38;2;255;200;60m\xe2\x9a\xa1SURP:%.3f\033[0m", surp_global);
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -5476,9 +5701,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -5503,7 +5728,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
-                     "[X]temp [C]class [O]flow [9]cone [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[X]temp [C]class [O]flow [9]cone [!]surp [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
@@ -7145,6 +7370,85 @@ static void render(int running, int speed_ms, int draw_mode) {
         }
     }
 
+    /* ── Prediction Surprise overlay panel ─────────────────────────────────── */
+    if (surp_mode) {
+        int sp_w = 44;
+        int sp_col = term_cols - sp_w - 2;
+        /* Stack below other active panels */
+        int sp_row = 3;
+        if (entropy_mode)   sp_row += 8;
+        if (temp_mode)      sp_row += 9;
+        if (lyapunov_mode)  sp_row += 8;
+        if (fourier_mode)   sp_row += 18;
+        if (fractal_mode)   sp_row += 11;
+        if (wolfram_mode)   sp_row += 14;
+        if (flow_mode)      sp_row += 9;
+        if (attractor_mode) sp_row += 8;
+        if (cone_mode >= 1) sp_row += 8;
+        if (sp_col < 1) sp_col = 1;
+
+        const char *sbdr = "\033[38;2;255;200;60;48;2;14;10;4m";
+        const char *sbg  = "\033[48;2;14;10;4m";
+        const char *srst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Surprise \xe2\x9a\xa1 ",
+                     sp_row, sp_col, sbdr);
+        for (int i = 15; i < sp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", srst);
+
+        /* Row 1: Mean surprisal */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sp_row + 1, sp_col, sbdr, sbg);
+        p += sprintf(p, " \033[38;2;200;180;120mMean: \033[1;38;2;255;220;100m%.4f bits",
+                     surp_global);
+        { int used = 24; for (int i = used; i < sp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sbdr, srst);
+
+        /* Row 2: Max surprisal */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sp_row + 2, sp_col, sbdr, sbg);
+        p += sprintf(p, " \033[38;2;200;180;120mMax:  \033[38;2;255;100;60m%.4f bits",
+                     surp_max_local);
+        { int used = 24; for (int i = used; i < sp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sbdr, srst);
+
+        /* Row 3: Predictable vs surprising cell counts */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sp_row + 3, sp_col, sbdr, sbg);
+        p += sprintf(p, " \033[38;2;80;180;255mPredictable: \033[38;2;120;220;255m%d",
+                     surp_predictable);
+        { int used = 18 + (surp_predictable >= 10 ? 1 : 0) + (surp_predictable >= 100 ? 1 : 0)
+                       + (surp_predictable >= 1000 ? 1 : 0) + (surp_predictable >= 10000 ? 1 : 0);
+          for (int i = used; i < sp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sbdr, srst);
+
+        /* Row 4: Surprising cells */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sp_row + 4, sp_col, sbdr, sbg);
+        p += sprintf(p, " \033[38;2;255;140;40mSurprising:  \033[38;2;255;200;80m%d",
+                     surp_surprising);
+        { int used = 18 + (surp_surprising >= 10 ? 1 : 0) + (surp_surprising >= 100 ? 1 : 0)
+                       + (surp_surprising >= 1000 ? 1 : 0) + (surp_surprising >= 10000 ? 1 : 0);
+          for (int i = used; i < sp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sbdr, srst);
+
+        /* Row 5: History depth */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sp_row + 5, sp_col, sbdr, sbg);
+        p += sprintf(p, " \033[38;2;120;110;90mHistory: %d/%d frames  [!]toggle",
+                     surp_hist_len, SURP_WINDOW);
+        { int used = 38; for (int i = used; i < sp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sbdr, srst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", sp_row + 6, sp_col, sbdr);
+        for (int i = 0; i < sp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", srst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -7647,6 +7951,12 @@ int main(int argc, char **argv) {
                 cone_sel_y = -1;
             }
         }
+        else if (key == '!') {
+            surp_mode = !surp_mode;
+            if (surp_mode) {
+                surp_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -8083,6 +8393,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh causal light cone every 8 generations while running */
         if (cone_mode == 2 && cone_sel_x >= 0 && (generation % 8 == 0)) {
             cone_compute();
+        }
+
+        /* Auto-refresh surprise field every 4 generations */
+        if (surp_mode && surp_stale && (generation % 4 == 0 || !running)) {
+            surp_compute();
         }
 
         render(running, speed_ms, draw_mode);
