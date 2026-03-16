@@ -851,6 +851,50 @@ static void cm_reset(void) {
             cm_corr[i][j] = (i == j) ? 1.0f : 0.0f;
 }
 
+/* ── Temporal Power Spectrum ──────────────────────────────────────────────── */
+/* DFT of each metric's time series from a 128-frame ring buffer, displayed as
+   a 16×32 frequency × metric heatmap using half-block rendering.  Reveals
+   dominant oscillation frequencies across all 16 metrics.  Blue = low power,
+   red = high power, peak frequency highlighted in white.  Sidebar shows
+   dominant period per metric, spectral entropy, total spectral power.
+   Toggle with '6' key. */
+
+#define PS_WINDOW  128   /* time series length for DFT */
+#define PS_N       PP_N_METRICS   /* 16 metrics */
+#define PS_NFREQ   32   /* number of frequency bins (half of PS_WINDOW/2, decimated) */
+
+static int   ps_mode = 0;           /* 0=off, 1=on */
+static float ps_buf[PS_WINDOW][PS_N]; /* ring buffer of metric snapshots */
+static int   ps_head = 0;           /* next write position */
+static int   ps_count = 0;          /* valid entries (≤ PS_WINDOW) */
+static float ps_power[PS_N][PS_NFREQ]; /* power spectrum: metric × freq */
+static float ps_peak_freq[PS_N];    /* dominant frequency index per metric */
+static float ps_peak_period[PS_N];  /* dominant period per metric */
+static float ps_entropy[PS_N];      /* spectral entropy per metric */
+static float ps_total_power[PS_N];  /* total spectral power per metric */
+static float ps_global_max = 0.0f;  /* max power across all bins */
+static int   ps_stale = 1;          /* needs recomputation */
+
+/* Record current metrics into the ring buffer */
+static void ps_record(void);
+/* Compute DFT and power spectrum */
+static void ps_compute(void);
+/* Reset history */
+static void ps_reset(void) {
+    ps_head = 0;
+    ps_count = 0;
+    ps_stale = 1;
+    ps_global_max = 0.0f;
+    for (int i = 0; i < PS_N; i++) {
+        ps_peak_freq[i] = 0.0f;
+        ps_peak_period[i] = 0.0f;
+        ps_entropy[i] = 0.0f;
+        ps_total_power[i] = 0.0f;
+        for (int j = 0; j < PS_NFREQ; j++)
+            ps_power[i][j] = 0.0f;
+    }
+}
+
 /* ── Geodesic Distance Field ─────────────────────────────────────────────── */
 /* Treats all living cells as nodes in an 8-connected graph.  BFS from a
    user-selected seed cell computes shortest-path (geodesic) distance through
@@ -1192,7 +1236,8 @@ static void split_set_overlay(int idx) {
     surp_mode = 0; mi_mode = 0; cplx_mode = 0; topo_mode = 0;
     rg_mode = 0; kc_mode = 0; corr_mode = 0; eprod_mode = 0;
     wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
-    perc_mode = 0; ising_mode = 0; pb_mode = 0; cm_mode = 0; gd_mode = 0;
+    perc_mode = 0; ising_mode = 0; pb_mode = 0; cm_mode = 0; ps_mode = 0;
+    gd_mode = 0;
     rp_mode = 0;
     pt_mode = 0;
 
@@ -1225,6 +1270,7 @@ static void split_set_overlay(int idx) {
         case 25: gd_mode = 2; break;
         case 26: rp_mode = 1; break;
         case 27: pt_mode = 1; break;
+        case 28: ps_mode = 1; break;
     }
 }
 
@@ -1256,6 +1302,7 @@ static int split_detect_current(void) {
     if (gd_mode) return 25;
     if (rp_mode) return 26;
     if (pt_mode) return 27;
+    if (ps_mode) return 28;
     return 0;
 }
 
@@ -1666,6 +1713,92 @@ static void cm_compute(void) {
         }
     }
     cm_stale = 0;
+}
+
+/* ── Temporal Power Spectrum implementations ───────────────────────────────── */
+
+static void ps_record(void) {
+    for (int i = 0; i < PS_N; i++)
+        ps_buf[ps_head][i] = pp_read_metric(i);
+    ps_head = (ps_head + 1) % PS_WINDOW;
+    if (ps_count < PS_WINDOW) ps_count++;
+    ps_stale = 1;
+}
+
+static void ps_compute(void) {
+    if (ps_count < 8) { ps_stale = 0; return; } /* need minimum data */
+    int n = ps_count;
+
+    /* We compute DFT for 64 frequency bins (half the window) then
+       decimate to PS_NFREQ=32 by picking every other bin.
+       Using Goertzel-style direct DFT — no external library needed. */
+    float global_max = 0.0f;
+
+    for (int m = 0; m < PS_N; m++) {
+        /* Extract time series in chronological order */
+        float ts[PS_WINDOW];
+        for (int k = 0; k < n; k++) {
+            int idx = (ps_head - n + k + PS_WINDOW) % PS_WINDOW;
+            ts[k] = ps_buf[idx][m];
+        }
+
+        /* Remove DC (mean) to focus on oscillations */
+        double mean = 0.0;
+        for (int k = 0; k < n; k++) mean += ts[k];
+        mean /= n;
+        for (int k = 0; k < n; k++) ts[k] -= (float)mean;
+
+        /* Apply Hann window to reduce spectral leakage */
+        for (int k = 0; k < n; k++) {
+            float w = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * k / (n - 1)));
+            ts[k] *= w;
+        }
+
+        /* Direct DFT for PS_NFREQ frequency bins */
+        float total = 0.0f;
+        float peak_val = -1.0f;
+        int   peak_bin = 0;
+
+        for (int f = 0; f < PS_NFREQ; f++) {
+            /* Map to actual frequency bin: skip DC, take bins 1..PS_NFREQ */
+            int fbin = f + 1;
+            double re = 0.0, im = 0.0;
+            double phase_inc = 2.0 * 3.14159265358979 * fbin / n;
+            for (int k = 0; k < n; k++) {
+                double phase = phase_inc * k;
+                re += ts[k] * cos(phase);
+                im += ts[k] * sin(phase);
+            }
+            float pwr = (float)(re * re + im * im) / (n * n);
+            ps_power[m][f] = pwr;
+            total += pwr;
+            if (pwr > peak_val) {
+                peak_val = pwr;
+                peak_bin = f;
+            }
+            if (pwr > global_max) global_max = pwr;
+        }
+
+        ps_total_power[m] = total;
+        ps_peak_freq[m] = (float)(peak_bin + 1);  /* frequency bin (1-based) */
+        /* Period in frames (sampling every 2 gens, so period = n / freq_bin * 2) */
+        ps_peak_period[m] = (peak_bin + 1 > 0) ? (float)n / (peak_bin + 1) : 0.0f;
+
+        /* Spectral entropy: -sum(p * log(p)) where p = normalized power */
+        ps_entropy[m] = 0.0f;
+        if (total > 1e-20f) {
+            for (int f = 0; f < PS_NFREQ; f++) {
+                float p = ps_power[m][f] / total;
+                if (p > 1e-20f)
+                    ps_entropy[m] -= p * log2f(p);
+            }
+            /* Normalize to [0,1]: max entropy = log2(PS_NFREQ) */
+            ps_entropy[m] /= log2f((float)PS_NFREQ);
+        }
+    }
+
+    ps_global_max = global_max;
+    ps_stale = 0;
 }
 
 /* ── Recurrence Plot implementations ──────────────────────────────────────── */
@@ -3353,6 +3486,7 @@ static void demo_reset_overlays(void) {
     pb_mode = 0;
     pp_mode = 0;
     cm_mode = 0;
+    ps_mode = 0;
     gd_mode = 0;
     rp_mode = 0;
     sa_mode = 0;
@@ -9739,6 +9873,14 @@ static void render(int running, int speed_ms, int draw_mode) {
                  cm_count, CM_WINDOW);
     }
 
+    /* Power spectrum indicator */
+    char ps_str[96] = "";
+    if (ps_mode) {
+        snprintf(ps_str, sizeof(ps_str),
+                 " \033[38;2;60;120;220m\xe2\x96\xa6" "FFT:%d/%d\033[0m",
+                 ps_count, PS_WINDOW);
+    }
+
     /* Recurrence plot indicator */
     char rp_str[96] = "";
     if (rp_mode) {
@@ -9932,9 +10074,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, rp_str, sa_str, pt_str, ad_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, ps_str, rp_str, sa_str, pt_str, ad_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -14431,6 +14573,246 @@ static void render(int running, int speed_ms, int draw_mode) {
         #undef CM_TOP
     }
 
+    /* ── Temporal Power Spectrum sidebar panel ─────────────────────────── */
+    if (ps_mode && ps_count >= 8) {
+        if (ps_stale) ps_compute();
+
+        int ps_pw = 56;  /* panel width */
+        int ps_col = term_cols - ps_pw - 2;
+        int ps_row_p = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   ps_row_p += 8;
+        if (temp_mode)      ps_row_p += 9;
+        if (lyapunov_mode)  ps_row_p += 8;
+        if (fourier_mode)   ps_row_p += 18;
+        if (fractal_mode)   ps_row_p += 11;
+        if (wolfram_mode)   ps_row_p += 14;
+        if (flow_mode)      ps_row_p += 9;
+        if (attractor_mode) ps_row_p += 7;
+        if (cone_mode)      ps_row_p += 12;
+        if (surp_mode)      ps_row_p += 8;
+        if (mi_mode)        ps_row_p += 8;
+        if (cplx_mode)      ps_row_p += 8;
+        if (topo_mode)      ps_row_p += 10;
+        if (rg_mode)        ps_row_p += 12;
+        if (kc_mode)        ps_row_p += 11;
+        if (corr_mode)      ps_row_p += 10;
+        if (eprod_mode)     ps_row_p += 8;
+        if (vort_mode)      ps_row_p += 8;
+        if (wave_mode)      ps_row_p += 8;
+        if (ergo_mode)      ps_row_p += 10;
+        if (perc_mode)      ps_row_p += 10;
+        if (ising_mode)     ps_row_p += 10;
+        if (pb_mode)        ps_row_p += 14;
+        if (gd_mode >= 2)   ps_row_p += 8;
+        if (pp_mode)        ps_row_p += 18;
+        if (cm_mode && cm_count >= 4) ps_row_p += 11 + CM_N;
+        if (ps_col < 1) ps_col = 1;
+
+        const char *psbdr = "\033[38;2;60;120;220;48;2;6;8;18m";
+        const char *psbg  = "\033[48;2;6;8;18m";
+        const char *psrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Power Spectrum ",
+                     ps_row_p, ps_col, psbdr);
+        for (int i = 18; i < ps_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", psrst);
+
+        /* Row 1: Window info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ps_row_p + 1, ps_col, psbdr, psbg);
+        {
+            int n = sprintf(p, " \033[38;2;140;180;220mFrames: %d/%d  "
+                               "\033[38;2;80;100;140m[6]toggle",
+                            ps_count, PS_WINDOW);
+            p += n;
+            int used = 28 + (ps_count >= 10 ? 1 : 0) + (ps_count >= 100 ? 1 : 0);
+            for (int i = used; i < ps_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", psbdr, psrst);
+
+        /* Row 2: Frequency axis label */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ps_row_p + 2, ps_col, psbdr, psbg);
+        p += sprintf(p, " \033[38;2;100;140;180m      \xe2\x86\x90 freq (low)     freq (high) \xe2\x86\x92");
+        {
+            int used = 47;
+            for (int i = used; i < ps_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", psbdr, psrst);
+
+        /* Rows 3..3+8-1: 16×32 heatmap via half-block rendering (8 char rows = 16 metric rows) */
+        int hm_rows = (PS_N + 1) / 2;  /* 8 character rows for 16 metrics */
+        for (int hr = 0; hr < hm_rows; hr++) {
+            int m_top = hr * 2;       /* top metric index */
+            int m_bot = hr * 2 + 1;   /* bottom metric index */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         ps_row_p + 3 + hr, ps_col, psbdr, psbg);
+            /* Row label: first 5 chars of top metric */
+            p += sprintf(p, " \033[38;2;140;180;220m%-5.5s ", pp_metric_table[m_top].name);
+
+            /* 32 frequency bins as half-block chars */
+            for (int f = 0; f < PS_NFREQ; f++) {
+                float p_top = ps_power[m_top][f];
+                float p_bot = (m_bot < PS_N) ? ps_power[m_bot][f] : 0.0f;
+
+                /* Normalize to global max */
+                float t_top = (ps_global_max > 1e-20f) ? p_top / ps_global_max : 0.0f;
+                float t_bot = (ps_global_max > 1e-20f) ? p_bot / ps_global_max : 0.0f;
+                if (t_top > 1.0f) t_top = 1.0f;
+                if (t_bot > 1.0f) t_bot = 1.0f;
+
+                /* Check if this is the peak frequency for the metric */
+                int is_peak_top = ((int)ps_peak_freq[m_top] - 1 == f) && (ps_total_power[m_top] > 1e-15f);
+                int is_peak_bot = (m_bot < PS_N) && ((int)ps_peak_freq[m_bot] - 1 == f) && (ps_total_power[m_bot] > 1e-15f);
+
+                int r_top, g_top, b_top, r_bot, g_bot, b_bot;
+
+                if (is_peak_top) {
+                    /* White highlight for peak */
+                    r_top = 255; g_top = 255; b_top = 255;
+                } else {
+                    /* Blue (low) → cyan → yellow → red (high) */
+                    if (t_top < 0.25f) {
+                        float s = t_top / 0.25f;
+                        r_top = (int)(10 * (1-s) + 20 * s);
+                        g_top = (int)(10 * (1-s) + 80 * s);
+                        b_top = (int)(40 * (1-s) + 180 * s);
+                    } else if (t_top < 0.5f) {
+                        float s = (t_top - 0.25f) / 0.25f;
+                        r_top = (int)(20 * (1-s) + 40 * s);
+                        g_top = (int)(80 * (1-s) + 200 * s);
+                        b_top = (int)(180 * (1-s) + 220 * s);
+                    } else if (t_top < 0.75f) {
+                        float s = (t_top - 0.5f) / 0.25f;
+                        r_top = (int)(40 * (1-s) + 240 * s);
+                        g_top = (int)(200 * (1-s) + 200 * s);
+                        b_top = (int)(220 * (1-s) + 40 * s);
+                    } else {
+                        float s = (t_top - 0.75f) / 0.25f;
+                        r_top = (int)(240 * (1-s) + 255 * s);
+                        g_top = (int)(200 * (1-s) + 60 * s);
+                        b_top = (int)(40 * (1-s) + 30 * s);
+                    }
+                }
+
+                if (is_peak_bot) {
+                    r_bot = 255; g_bot = 255; b_bot = 255;
+                } else {
+                    if (t_bot < 0.25f) {
+                        float s = t_bot / 0.25f;
+                        r_bot = (int)(10 * (1-s) + 20 * s);
+                        g_bot = (int)(10 * (1-s) + 80 * s);
+                        b_bot = (int)(40 * (1-s) + 180 * s);
+                    } else if (t_bot < 0.5f) {
+                        float s = (t_bot - 0.25f) / 0.25f;
+                        r_bot = (int)(20 * (1-s) + 40 * s);
+                        g_bot = (int)(80 * (1-s) + 200 * s);
+                        b_bot = (int)(180 * (1-s) + 220 * s);
+                    } else if (t_bot < 0.75f) {
+                        float s = (t_bot - 0.5f) / 0.25f;
+                        r_bot = (int)(40 * (1-s) + 240 * s);
+                        g_bot = (int)(200 * (1-s) + 200 * s);
+                        b_bot = (int)(220 * (1-s) + 40 * s);
+                    } else {
+                        float s = (t_bot - 0.75f) / 0.25f;
+                        r_bot = (int)(240 * (1-s) + 255 * s);
+                        g_bot = (int)(200 * (1-s) + 60 * s);
+                        b_bot = (int)(40 * (1-s) + 30 * s);
+                    }
+                }
+
+                /* Half-block: top pixel = foreground (▀), bottom pixel = background */
+                p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80",
+                             r_top, g_top, b_top, r_bot, g_bot, b_bot);
+            }
+            p += sprintf(p, "%s", psbg);
+            {
+                int used = 7 + PS_NFREQ;
+                for (int i = used; i < ps_pw - 1; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", psbdr, psrst);
+        }
+
+        /* Separator */
+        int ps_sep_row = ps_row_p + 3 + hm_rows;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ps_sep_row, ps_col, psbdr, psbg);
+        p += sprintf(p, " \033[38;2;40;60;100m");
+        for (int i = 1; i < ps_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", psbdr, psrst);
+
+        /* Sidebar: dominant period per metric (top 4 strongest + spectral entropy summary) */
+        /* Find 4 metrics with highest total power */
+        int top_idx[4] = {0, 1, 2, 3};
+        float top_pwr[4] = {ps_total_power[0], ps_total_power[1], ps_total_power[2], ps_total_power[3]};
+        for (int m = 4; m < PS_N; m++) {
+            int min_k = 0;
+            for (int k = 1; k < 4; k++)
+                if (top_pwr[k] < top_pwr[min_k]) min_k = k;
+            if (ps_total_power[m] > top_pwr[min_k]) {
+                top_pwr[min_k] = ps_total_power[m];
+                top_idx[min_k] = m;
+            }
+        }
+        /* Sort by power descending */
+        for (int i = 0; i < 3; i++)
+            for (int j = i + 1; j < 4; j++)
+                if (top_pwr[j] > top_pwr[i]) {
+                    float tmp = top_pwr[i]; top_pwr[i] = top_pwr[j]; top_pwr[j] = tmp;
+                    int ti = top_idx[i]; top_idx[i] = top_idx[j]; top_idx[j] = ti;
+                }
+
+        for (int k = 0; k < 4; k++) {
+            int m = top_idx[k];
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         ps_sep_row + 1 + k, ps_col, psbdr, psbg);
+            {
+                const char *prefix = (k == 0) ? "\xe2\x96\xb6 Dominant:" : "          ";
+                int n = sprintf(p, " \033[38;2;140;200;255m%s "
+                                   "\033[38;2;200;220;255m%-7.7s "
+                                   "\033[38;2;100;160;220mT=%.1f "
+                                   "\033[38;2;80;140;180mH=%.2f",
+                                prefix, pp_metric_table[m].name,
+                                ps_peak_period[m], ps_entropy[m]);
+                p += n;
+                int used = 11 + 8 + 6 + 6;
+                for (int i = used; i < ps_pw - 1; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", psbdr, psrst);
+        }
+
+        /* Overall spectral character line */
+        float mean_entropy = 0.0f;
+        for (int m = 0; m < PS_N; m++) mean_entropy += ps_entropy[m];
+        mean_entropy /= PS_N;
+        const char *character = (mean_entropy < 0.4f) ? "PERIODIC" :
+                                (mean_entropy < 0.7f) ? "MIXED   " : "CHAOTIC ";
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ps_sep_row + 5, ps_col, psbdr, psbg);
+        {
+            int cr = (mean_entropy < 0.5f) ? 80 : 255;
+            int cg = (mean_entropy < 0.5f) ? 200 : (mean_entropy < 0.7f ? 200 : 80);
+            int cb = (mean_entropy < 0.5f) ? 255 : 60;
+            int n = sprintf(p, " \033[38;2;%d;%d;%dm\xe2\x97\x86 %s "
+                               "\033[38;2;120;150;180m<H>=%.3f  pwr=%.1e",
+                            cr, cg, cb, character, mean_entropy, ps_global_max);
+            p += n;
+            int used = 12 + 8 + 12;
+            for (int i = used; i < ps_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", psbdr, psrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94",
+                     ps_sep_row + 6, ps_col, psbdr);
+        for (int i = 0; i < ps_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", psrst);
+    }
+
     /* ── Recurrence Plot sidebar panel ─────────────────────────────────── */
     if (rp_mode && rp_count >= 4) {
         int rp_pw = 38;  /* panel width */
@@ -14463,6 +14845,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (gd_mode >= 2)   rp_row_p += 8;
         if (pp_mode)        rp_row_p += 18;
         if (cm_mode && cm_count >= 4) rp_row_p += 11 + CM_N;
+        if (ps_mode && ps_count >= 8) rp_row_p += 18;
         if (rp_col < 1) rp_col = 1;
 
         const char *rpbdr = "\033[38;2;180;60;220;48;2;12;6;18m";
@@ -14662,6 +15045,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (gd_mode >= 2)   sa_row_p += 8;
         if (pp_mode)        sa_row_p += 18;
         if (cm_mode && cm_count >= 4) sa_row_p += 11 + CM_N;
+        if (ps_mode && ps_count >= 8) sa_row_p += 18;
         if (rp_mode && rp_count >= 4) sa_row_p += 10 + (rp_count < RP_DISP ? (rp_count+1)/2 : (RP_DISP+1)/2);
         if (pt_mode)        sa_row_p += 10;
         if (sa_col < 1) sa_col = 1;
@@ -14886,6 +15270,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (gd_mode >= 2)   pt_row_p += 8;
         if (pp_mode)        pt_row_p += 18;
         if (cm_mode && cm_count >= 4) pt_row_p += 11 + CM_N;
+        if (ps_mode && ps_count >= 8) pt_row_p += 18;
         if (rp_mode && rp_count >= 4) pt_row_p += 10 + (rp_count < RP_DISP ? (rp_count+1)/2 : (RP_DISP+1)/2);
         if (sa_mode && sa_hist_count > 2) pt_row_p += 10 + 16; /* SA_CH=16 */
         if (pt_col < 1) pt_col = 1;
@@ -16351,8 +16736,19 @@ int main(int argc, char **argv) {
             printf("\033[2J"); fflush(stdout);
         }
         else if (key == '6') {
-            if (ecosystem_mode)
+            if (ecosystem_mode) {
                 brush_species = (brush_species == 1) ? 2 : 1;
+            } else {
+                ps_mode = !ps_mode;
+                if (ps_mode) {
+                    ps_reset();
+                    flash_set("Power Spectrum: 16-metric temporal FFT [6]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Power Spectrum off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
         }
         else if (key == '{') {
             if (sa_mode) {
@@ -16860,6 +17256,14 @@ int main(int argc, char **argv) {
             cm_record();
             if (cm_stale && cm_count >= 4) {
                 cm_compute();
+            }
+        }
+
+        /* Power spectrum: record all metrics every 2 generations */
+        if (ps_mode && running && (generation % 2 == 0)) {
+            ps_record();
+            if (ps_stale && ps_count >= 8) {
+                ps_compute();
             }
         }
 
