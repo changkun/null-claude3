@@ -98,6 +98,9 @@
  *                 [</>] cycle X metric, [{/}] cycle Z metric
  *                 Arrow keys rotate camera, [R] toggle auto-rotate
  *   7           Toggle particle tracker (velocity field from component matching)
+ *   `           Toggle spatial coherence (Kuramoto phase sync heatmap)
+ *                 Assigns oscillation phase from timeline, measures local R
+ *                 Dark=desynchronized, cyan=partial, white=perfect sync
  *   8           Toggle anomaly detector (statistical watchdog for all 16 metrics)
  *                 Cycles: off → watch → watch+auto-pause → off
  *                 +/- adjust alert threshold (1.0σ–5.0σ, default 2.0σ)
@@ -1038,7 +1041,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 28
+#define N_SPLIT_OVERLAYS 29
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1073,6 +1076,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Geodesic",     '"'  },  /* 25 */
     { "Recurrence",   'o'  },  /* 26 */
     { "Particles",    '7'  },  /* 27 */
+    { "Coherence",    '`'  },  /* 28 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1177,6 +1181,32 @@ static int   pt_spark_count = 0;
 
 static void  pt_compute(void);
 
+/* ── Spatial Coherence (Kuramoto Synchronization) ────────────────────────── */
+/* Phase-synchronization heatmap: each cell's on/off oscillation is assigned an
+   instantaneous phase from its flip history in the timeline buffer.  The
+   Kuramoto order parameter R = |1/N Σ e^{iθ}| is computed over a local
+   neighbourhood (radius COH_R).  High R → cells oscillate in lockstep
+   (synchronized domain); low R → desynchronised / chaotic.
+   Cyan = synced, dark = desynced, white = perfect sync.
+   Toggle with '`' key (outside split mode). */
+
+#define COH_R       3           /* neighbourhood radius for local R */
+#define COH_DEPTH   32          /* timeline frames used for phase estimate */
+#define COH_HIST_LEN 64        /* sparkline history */
+
+static float coh_grid[MAX_H][MAX_W]; /* per-cell Kuramoto R ∈ [0,1] */
+static float coh_phase[MAX_H][MAX_W]; /* instantaneous phase ∈ [0, 2π) */
+static int   coh_mode = 0;           /* 0=off, 1=on */
+static int   coh_stale = 1;
+static float coh_global_R = 0.0f;    /* global mean order parameter */
+static float coh_sync_frac = 0.0f;   /* fraction of cells with R > 0.7 */
+static int   coh_n_domains = 0;      /* number of coherent domains */
+static float coh_hist[COH_HIST_LEN]; /* sparkline of global R */
+static int   coh_hist_idx = 0;
+static int   coh_hist_count = 0;
+
+static void  coh_compute(void);
+
 /* ── Anomaly Detector ─────────────────────────────────────────────────────── */
 /* Real-time watchdog that monitors all 16 scalar metrics for statistical
    anomalies.  Maintains running mean and variance (Welford's algorithm) over
@@ -1240,6 +1270,7 @@ static void split_set_overlay(int idx) {
     gd_mode = 0;
     rp_mode = 0;
     pt_mode = 0;
+    coh_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1270,7 +1301,8 @@ static void split_set_overlay(int idx) {
         case 25: gd_mode = 2; break;
         case 26: rp_mode = 1; break;
         case 27: pt_mode = 1; break;
-        case 28: ps_mode = 1; break;
+        case 28: coh_mode = 1; break;
+        case 29: ps_mode = 1; break;
     }
 }
 
@@ -1302,7 +1334,8 @@ static int split_detect_current(void) {
     if (gd_mode) return 25;
     if (rp_mode) return 26;
     if (pt_mode) return 27;
-    if (ps_mode) return 28;
+    if (coh_mode) return 28;
+    if (ps_mode) return 29;
     return 0;
 }
 
@@ -2620,6 +2653,7 @@ static void grid_step(void) {
     ising_stale = 1;
     gd_stale = 1;
     pt_stale = 1;
+    coh_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -3490,6 +3524,7 @@ static void demo_reset_overlays(void) {
     gd_mode = 0;
     rp_mode = 0;
     sa_mode = 0;
+    coh_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -3557,6 +3592,7 @@ static void demo_setup_scene(int idx) {
             case ';': ising_mode = 1; ising_compute(); break;
             case ':': pb_mode = 1; pb_compute(); break;
             case '7': pt_mode = 1; pt_compute(); break;
+            case '`': coh_mode = 1; coh_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -6807,6 +6843,190 @@ static RGB ergo_to_rgb(float dev) {
     }
 }
 
+/* ── Spatial Coherence computation ─────────────────────────────────────────── */
+/* Phase-synchronization via Kuramoto order parameter over local neighbourhoods.
+   Step 1: Assign instantaneous phase to each cell from its flip history.
+   Step 2: Compute local R = |1/N Σ e^{iθ}| over radius COH_R.
+   Step 3: Aggregate global statistics. */
+
+static RGB coh_to_rgb(float r) {
+    /* r ∈ [0,1]:  0=desynced (dark blue), 0.5=partial (cyan), 1=synced (white) */
+    if (r < 0.15f) {
+        float u = r / 0.15f;
+        return (RGB){(unsigned char)(5 + 10 * u),
+                     (unsigned char)(8 + 25 * u),
+                     (unsigned char)(20 + 50 * u)};
+    } else if (r < 0.4f) {
+        float u = (r - 0.15f) / 0.25f;
+        return (RGB){(unsigned char)(15 + 10 * u),
+                     (unsigned char)(33 + 100 * u),
+                     (unsigned char)(70 + 100 * u)};
+    } else if (r < 0.7f) {
+        float u = (r - 0.4f) / 0.3f;
+        return (RGB){(unsigned char)(25 + 80 * u),
+                     (unsigned char)(133 + 80 * u),
+                     (unsigned char)(170 + 40 * u)};
+    } else if (r < 0.9f) {
+        float u = (r - 0.7f) / 0.2f;
+        return (RGB){(unsigned char)(105 + 100 * u),
+                     (unsigned char)(213 + 32 * u),
+                     (unsigned char)(210 + 30 * u)};
+    } else {
+        float u = (r - 0.9f) / 0.1f;
+        return (RGB){(unsigned char)(205 + 50 * u),
+                     (unsigned char)(245 + 10 * u),
+                     (unsigned char)(240 + 15 * u)};
+    }
+}
+
+static void coh_compute(void) {
+    /* Step 1: Assign instantaneous phase based on flip timing in timeline.
+       We extract the on/off sequence for each cell from the last COH_DEPTH
+       frames and compute phase as 2π × (fraction of period elapsed since
+       last transition).  Cells that never flip get phase 0. */
+
+    int depth = tl_len < COH_DEPTH ? tl_len : COH_DEPTH;
+    if (depth < 4) {
+        /* Not enough history — zero everything */
+        memset(coh_grid, 0, sizeof(float) * MAX_H * MAX_W);
+        memset(coh_phase, 0, sizeof(float) * MAX_H * MAX_W);
+        coh_global_R = 0.0f;
+        coh_sync_frac = 0.0f;
+        coh_n_domains = 0;
+        coh_stale = 0;
+        return;
+    }
+
+    float two_pi = 6.283185307f;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Extract on/off bit pattern from timeline */
+            int flips = 0;
+            int last_flip = -1;         /* distance from present of most recent flip */
+            int prev_state = -1;
+
+            for (int i = 0; i < depth; i++) {
+                TimelineFrame *f = timeline_get(i);
+                if (!f) break;
+                int st = f->grid[y][x] > 0 ? 1 : 0;
+                if (prev_state >= 0 && st != prev_state) {
+                    flips++;
+                    if (last_flip < 0) last_flip = i;
+                }
+                prev_state = st;
+            }
+
+            if (flips < 1) {
+                /* Static cell — no oscillation, assign phase 0 */
+                coh_phase[y][x] = 0.0f;
+            } else {
+                /* Estimate period from flip count: period ≈ 2 * depth / flips */
+                float period = 2.0f * (float)depth / (float)flips;
+                /* Phase = 2π × (time since last flip / period) */
+                float phase_frac = (last_flip >= 0) ?
+                    (float)last_flip / period : 0.0f;
+                /* Wrap to [0, 2π) */
+                phase_frac -= (int)phase_frac;
+                coh_phase[y][x] = phase_frac * two_pi;
+            }
+        }
+    }
+
+    /* Step 2: Compute local Kuramoto order parameter for each cell */
+    double sum_global_R = 0.0;
+    int n_active = 0;     /* cells that are oscillating (have flips) */
+    int n_synced = 0;     /* cells with R > 0.7 */
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Sum e^{iθ} over neighbourhood */
+            double sum_cos = 0.0, sum_sin = 0.0;
+            int count = 0;
+
+            int y0 = y - COH_R, y1 = y + COH_R;
+            int x0 = x - COH_R, x1 = x + COH_R;
+            if (y0 < 0) y0 = 0;
+            if (y1 >= H) y1 = H - 1;
+            if (x0 < 0) x0 = 0;
+            if (x1 >= W) x1 = W - 1;
+
+            for (int ny = y0; ny <= y1; ny++) {
+                for (int nx = x0; nx <= x1; nx++) {
+                    float ph = coh_phase[ny][nx];
+                    if (ph > 0.001f || grid[ny][nx] > 0) {
+                        /* Include cells that are oscillating or alive */
+                        sum_cos += cos(ph);
+                        sum_sin += sin(ph);
+                        count++;
+                    }
+                }
+            }
+
+            if (count >= 2) {
+                float R = (float)sqrt(sum_cos * sum_cos + sum_sin * sum_sin) / (float)count;
+                if (R > 1.0f) R = 1.0f;
+                coh_grid[y][x] = R;
+                sum_global_R += R;
+                n_active++;
+                if (R > 0.7f) n_synced++;
+            } else {
+                coh_grid[y][x] = 0.0f;
+            }
+        }
+    }
+
+    /* Step 3: Global statistics */
+    coh_global_R = n_active > 0 ? (float)(sum_global_R / n_active) : 0.0f;
+    coh_sync_frac = n_active > 0 ? (float)n_synced / (float)n_active : 0.0f;
+
+    /* Count coherent domains via simple flood-fill on high-R cells */
+    {
+        static unsigned char visited[MAX_H][MAX_W];
+        memset(visited, 0, sizeof(unsigned char) * H * MAX_W);
+        static int qx[MAX_W * MAX_H / 8];
+        static int qy[MAX_W * MAX_H / 8];
+        int qmax = MAX_W * MAX_H / 8;
+        int domains = 0;
+
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (!visited[y][x] && coh_grid[y][x] > 0.6f) {
+                    /* BFS flood fill */
+                    domains++;
+                    int qh = 0, qt = 0;
+                    qx[qt] = x; qy[qt] = y; qt++;
+                    visited[y][x] = 1;
+                    while (qh < qt) {
+                        int cx = qx[qh], cy = qy[qh]; qh++;
+                        for (int dy = -1; dy <= 1; dy++) {
+                            for (int dx = -1; dx <= 1; dx++) {
+                                if (dx == 0 && dy == 0) continue;
+                                int nx2 = cx + dx, ny2 = cy + dy;
+                                if (nx2 >= 0 && nx2 < W && ny2 >= 0 && ny2 < H &&
+                                    !visited[ny2][nx2] && coh_grid[ny2][nx2] > 0.6f) {
+                                    visited[ny2][nx2] = 1;
+                                    if (qt < qmax) {
+                                        qx[qt] = nx2; qy[qt] = ny2; qt++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        coh_n_domains = domains;
+    }
+
+    /* Record sparkline */
+    coh_hist[coh_hist_idx] = coh_global_R;
+    coh_hist_idx = (coh_hist_idx + 1) % COH_HIST_LEN;
+    if (coh_hist_count < COH_HIST_LEN) coh_hist_count++;
+
+    coh_stale = 0;
+}
+
 /* ── Percolation Analysis computation ──────────────────────────────────────── */
 /* Flood-fill live cells into clusters, find largest, detect spanning. */
 static void perc_compute(void) {
@@ -7842,6 +8062,7 @@ static void split_ensure_computed(int idx) {
         case 25: if (gd_stale && gd_seed_x >= 0) gd_compute(); break;
         case 26: if (rp_stale && rp_count >= 4) rp_compute(); break;
         case 27: if (pt_stale) pt_compute(); break;
+        case 28: if (coh_stale) coh_compute(); break;
         default: break;
     }
 }
@@ -9424,6 +9645,21 @@ static int cell_color(int x, int y, RGB *out) {
                 out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
             }
             return grid[y][x] ? 1 : 27; /* 27 = ergodicity ghost */
+        }
+        return 0;
+    }
+
+    /* Spatial coherence overlay: Kuramoto synchronization */
+    if (coh_mode) {
+        float r = coh_grid[y][x];
+        if (r > 0.02f || grid[y][x]) {
+            *out = coh_to_rgb(r);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 200 ? out->r + 55 : 255);
+                out->g = (unsigned char)(out->g < 200 ? out->g + 55 : 255);
+                out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
+            }
+            return grid[y][x] ? 1 : 29; /* 29 = coherence ghost */
         }
         return 0;
     }
@@ -13466,6 +13702,128 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", erst);
     }
 
+    /* ── Spatial Coherence overlay panel ──────────────────────────────────── */
+    if (coh_mode) {
+        int ch_w = 46;
+        int ch_col = term_cols - ch_w - 2;
+        int ch_row = 3;
+        if (entropy_mode)   ch_row += 8;
+        if (temp_mode)      ch_row += 9;
+        if (lyapunov_mode)  ch_row += 8;
+        if (fourier_mode)   ch_row += 18;
+        if (fractal_mode)   ch_row += 11;
+        if (wolfram_mode)   ch_row += 14;
+        if (flow_mode)      ch_row += 9;
+        if (attractor_mode) ch_row += 8;
+        if (cone_mode >= 1) ch_row += 8;
+        if (surp_mode)      ch_row += 8;
+        if (mi_mode)        ch_row += 12;
+        if (cplx_mode)      ch_row += 11;
+        if (topo_mode)      ch_row += 11;
+        if (rg_mode)        ch_row += 11;
+        if (kc_mode)        ch_row += 9;
+        if (corr_mode)      ch_row += 9;
+        if (eprod_mode)     ch_row += 9;
+        if (vort_mode)      ch_row += 9;
+        if (wave_mode)      ch_row += 9;
+        if (ergo_mode)      ch_row += 10;
+        if (ch_col < 1) ch_col = 1;
+
+        const char *chbdr = "\033[38;2;80;220;220;48;2;6;12;14m";
+        const char *chbg  = "\033[48;2;6;12;14m";
+        const char *chrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xce\xa8 Spatial Coherence ",
+                     ch_row, ch_col, chbdr);
+        for (int i = 24; i < ch_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", chrst);
+
+        /* Row 1: Global R and sync fraction */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ch_row + 1, ch_col, chbdr, chbg);
+        p += sprintf(p, " \033[38;2;80;200;200mR=");
+        if (coh_global_R > 0.7f)
+            p += sprintf(p, "\033[1;38;2;200;255;255m%.3f", coh_global_R);
+        else if (coh_global_R > 0.4f)
+            p += sprintf(p, "\033[38;2;80;200;200m%.3f", coh_global_R);
+        else
+            p += sprintf(p, "\033[38;2;40;80;120m%.3f", coh_global_R);
+        p += sprintf(p, "\033[0;38;2;60;140;140m%s  sync:", chbg);
+        p += sprintf(p, "\033[38;2;160;220;220m%.1f%%", coh_sync_frac * 100.0f);
+        p += sprintf(p, "\033[38;2;60;140;140m  dom:");
+        p += sprintf(p, "\033[38;2;160;220;220m%d", coh_n_domains);
+        p += sprintf(p, "%s", chbg);
+        { int used = 38; for (int i = used; i < ch_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", chbdr, chrst);
+
+        /* Row 2: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ch_row + 2, ch_col, chbdr, chbg);
+        p += sprintf(p, " ");
+        for (int i = 0; i < 30; i++) {
+            float rv = (float)i / 29.0f;
+            RGB c = coh_to_rgb(rv);
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", c.r, c.g, c.b);
+        }
+        p += sprintf(p, "%s", chbg);
+        { int used = 31; for (int i = used; i < ch_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", chbdr, chrst);
+
+        /* Row 3: Label */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ch_row + 3, ch_col, chbdr, chbg);
+        p += sprintf(p, " \033[38;2;40;80;100mdesynced");
+        { for (int i = 0; i < 14; i++) *p++ = ' '; }
+        p += sprintf(p, "\033[38;2;200;255;255msynced");
+        p += sprintf(p, "%s", chbg);
+        { int used = 28; for (int i = used; i < ch_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", chbdr, chrst);
+
+        /* Row 4: Sparkline of global R */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ch_row + 4, ch_col, chbdr, chbg);
+        p += sprintf(p, " \033[38;2;60;140;140mR:");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int slen = coh_hist_count < 36 ? coh_hist_count : 36;
+            for (int i = 0; i < slen; i++) {
+                int idx = (coh_hist_idx - slen + i + COH_HIST_LEN) % COH_HIST_LEN;
+                float v = coh_hist[idx];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int si = (int)(v * 7.99f);
+                if (si > 7) si = 7;
+                /* Color based on value */
+                RGB sc = coh_to_rgb(v);
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sc.r, sc.g, sc.b, spark_chars[si]);
+            }
+        }
+        p += sprintf(p, "%s", chbg);
+        { int used = 3 + (coh_hist_count < 36 ? coh_hist_count : 36);
+          for (int i = used; i < ch_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", chbdr, chrst);
+
+        /* Row 5: Depth info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ch_row + 5, ch_col, chbdr, chbg);
+        int depth2 = tl_len < COH_DEPTH ? tl_len : COH_DEPTH;
+        p += sprintf(p, " \033[38;2;60;140;140mdepth:%d/%d  radius:%d",
+                     depth2, COH_DEPTH, COH_R);
+        p += sprintf(p, "%s", chbg);
+        { int used = 22; for (int i = used; i < ch_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", chbdr, chrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", ch_row + 6, ch_col, chbdr);
+        for (int i = 0; i < ch_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", chrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -13491,6 +13849,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)      pc_row += 9;
         if (wave_mode)      pc_row += 9;
         if (ergo_mode)      pc_row += 10;
+        if (coh_mode)       pc_row += 8;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -13667,6 +14026,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)      is_row += 9;
         if (wave_mode)      is_row += 9;
         if (ergo_mode)      is_row += 10;
+        if (coh_mode)       is_row += 8;
         if (perc_mode)      is_row += 10;
         if (is_col < 1) is_col = 1;
 
@@ -13835,6 +14195,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)      pb_row += 9;
         if (wave_mode)      pb_row += 9;
         if (ergo_mode)      pb_row += 10;
+        if (coh_mode)       pb_row += 8;
         if (perc_mode)      pb_row += 10;
         if (ising_mode)     pb_row += 10;
         if (pb_col < 1) pb_col = 1;
@@ -14046,6 +14407,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)      gd_row_p += 9;
         if (wave_mode)      gd_row_p += 9;
         if (ergo_mode)      gd_row_p += 10;
+        if (coh_mode)       gd_row_p += 8;
         if (perc_mode)      gd_row_p += 10;
         if (ising_mode)     gd_row_p += 10;
         if (pb_mode)        gd_row_p += 14;
@@ -14179,6 +14541,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)     pp_row += 8;
         if (wave_mode)     pp_row += 8;
         if (ergo_mode)     pp_row += 10;
+        if (coh_mode)      pp_row += 8;
         if (perc_mode)     pp_row += 10;
         if (ising_mode)    pp_row += 10;
         if (pb_mode)       pp_row += 14;
@@ -14398,6 +14761,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)     cm_row += 8;
         if (wave_mode)     cm_row += 8;
         if (ergo_mode)     cm_row += 10;
+        if (coh_mode)      cm_row += 8;
         if (perc_mode)     cm_row += 10;
         if (ising_mode)    cm_row += 10;
         if (pb_mode)       cm_row += 14;
@@ -14601,6 +14965,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)      ps_row_p += 8;
         if (wave_mode)      ps_row_p += 8;
         if (ergo_mode)      ps_row_p += 10;
+        if (coh_mode)       ps_row_p += 8;
         if (perc_mode)      ps_row_p += 10;
         if (ising_mode)     ps_row_p += 10;
         if (pb_mode)        ps_row_p += 14;
@@ -14839,6 +15204,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)      rp_row_p += 8;
         if (wave_mode)      rp_row_p += 8;
         if (ergo_mode)      rp_row_p += 10;
+        if (coh_mode)       rp_row_p += 8;
         if (perc_mode)      rp_row_p += 10;
         if (ising_mode)     rp_row_p += 10;
         if (pb_mode)        rp_row_p += 14;
@@ -15039,6 +15405,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)      sa_row_p += 8;
         if (wave_mode)      sa_row_p += 8;
         if (ergo_mode)      sa_row_p += 10;
+        if (coh_mode)       sa_row_p += 8;
         if (perc_mode)      sa_row_p += 10;
         if (ising_mode)     sa_row_p += 10;
         if (pb_mode)        sa_row_p += 14;
@@ -15264,6 +15631,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (vort_mode)      pt_row_p += 8;
         if (wave_mode)      pt_row_p += 8;
         if (ergo_mode)      pt_row_p += 10;
+        if (coh_mode)       pt_row_p += 8;
         if (perc_mode)      pt_row_p += 10;
         if (ising_mode)     pt_row_p += 10;
         if (pb_mode)        pt_row_p += 14;
@@ -16619,6 +16987,18 @@ int main(int argc, char **argv) {
             /* Backtick: cycle left panel overlay forward */
             split_left = (split_left + 1) % N_SPLIT_OVERLAYS;
         }
+        else if (key == '`') {
+            coh_mode = !coh_mode;
+            if (coh_mode) {
+                coh_stale = 1;
+                coh_compute();
+                flash_set("Coherence: Kuramoto sync domains [`]exit");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                flash_set("Coherence off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -17244,6 +17624,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh particle tracker every 2 generations */
         if (pt_mode && pt_stale && (generation % 2 == 0 || !running)) {
             pt_compute();
+        }
+
+        /* Auto-refresh spatial coherence every 4 generations (uses timeline) */
+        if (coh_mode && coh_stale && (generation % 4 == 0 || !running)) {
+            coh_compute();
         }
 
         /* Phase portrait: record metric pair every 2 generations */
