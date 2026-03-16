@@ -806,6 +806,37 @@ static void pp_reset(void) {
     pp_y_min = 1e30f; pp_y_max = -1e30f;
 }
 
+/* ── Metric Correlation Matrix ───────────────────────────────────────────── */
+/* Real-time 16×16 heatmap of pairwise Pearson correlations among all scalar
+   metrics.  Over a sliding window of ~64 frames, accumulates metric vectors
+   and computes the correlation matrix.  Blue = anti-correlated, white =
+   uncorrelated, red = strongly correlated.  Sidebar lists strongest and
+   weakest pairs.  Toggle with '\'' (single-quote) key. */
+
+#define CM_WINDOW  64    /* sliding window length */
+#define CM_N       PP_N_METRICS   /* 16 metrics */
+
+static int   cm_mode = 0;           /* 0=off, 1=on */
+static float cm_buf[CM_WINDOW][CM_N]; /* ring buffer of metric snapshots */
+static int   cm_head = 0;           /* next write position */
+static int   cm_count = 0;          /* valid entries (≤ CM_WINDOW) */
+static float cm_corr[CM_N][CM_N];   /* correlation matrix */
+static int   cm_stale = 1;          /* needs recomputation */
+
+/* Record current metrics into the sliding window */
+static void cm_record(void);
+/* Compute the 16×16 Pearson correlation matrix from the buffer */
+static void cm_compute(void);
+/* Reset history */
+static void cm_reset(void) {
+    cm_head = 0;
+    cm_count = 0;
+    cm_stale = 1;
+    for (int i = 0; i < CM_N; i++)
+        for (int j = 0; j < CM_N; j++)
+            cm_corr[i][j] = (i == j) ? 1.0f : 0.0f;
+}
+
 /* ── Spacetime Kymograph ─────────────────────────────────────────────────── */
 /* Displays a 1D horizontal slice of the grid evolving over time as a 2D
    spacetime diagram.  Y-axis = time (scrolling upward), X-axis = grid row.
@@ -841,7 +872,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 24
+#define N_SPLIT_OVERLAYS 25
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -872,6 +903,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Percolation",   '|' },  /* 21 */
     { "Ising",         ';' },  /* 22 */
     { "Persistence",   ':' },  /* 23 */
+    { "CorrMatrix",   '\'' },  /* 24 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -928,7 +960,7 @@ static void split_set_overlay(int idx) {
     surp_mode = 0; mi_mode = 0; cplx_mode = 0; topo_mode = 0;
     rg_mode = 0; kc_mode = 0; corr_mode = 0; eprod_mode = 0;
     wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
-    perc_mode = 0; ising_mode = 0; pb_mode = 0;
+    perc_mode = 0; ising_mode = 0; pb_mode = 0; cm_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -955,6 +987,7 @@ static void split_set_overlay(int idx) {
         case 21: perc_mode = 1; break;
         case 22: ising_mode = 1; break;
         case 23: pb_mode = 1; break;
+        case 24: cm_mode = 1; break;
     }
 }
 
@@ -982,6 +1015,7 @@ static int split_detect_current(void) {
     if (perc_mode) return 21;
     if (ising_mode) return 22;
     if (pb_mode) return 23;
+    if (cm_mode) return 24;
     return 0;
 }
 
@@ -1233,6 +1267,65 @@ static void kymo_record(void) {
     kymo_row_pop[kymo_head] = pop;
     kymo_head = (kymo_head + 1) % KYMO_DEPTH;
     if (kymo_count < KYMO_DEPTH) kymo_count++;
+}
+
+/* ── Metric Correlation Matrix implementations ────────────────────────────── */
+static void cm_record(void) {
+    for (int i = 0; i < CM_N; i++)
+        cm_buf[cm_head][i] = pp_read_metric(i);
+    cm_head = (cm_head + 1) % CM_WINDOW;
+    if (cm_count < CM_WINDOW) cm_count++;
+    cm_stale = 1;
+}
+
+static void cm_compute(void) {
+    if (cm_count < 4) { cm_stale = 0; return; } /* need minimum data */
+    int n = cm_count;
+
+    /* Compute means */
+    float mean[CM_N];
+    for (int i = 0; i < CM_N; i++) {
+        double s = 0.0;
+        for (int k = 0; k < n; k++) {
+            int idx = (cm_head - n + k + CM_WINDOW) % CM_WINDOW;
+            s += cm_buf[idx][i];
+        }
+        mean[i] = (float)(s / n);
+    }
+
+    /* Compute std devs */
+    float stddev[CM_N];
+    for (int i = 0; i < CM_N; i++) {
+        double ss = 0.0;
+        for (int k = 0; k < n; k++) {
+            int idx = (cm_head - n + k + CM_WINDOW) % CM_WINDOW;
+            float d = cm_buf[idx][i] - mean[i];
+            ss += (double)d * d;
+        }
+        stddev[i] = (float)sqrt(ss / n);
+    }
+
+    /* Compute Pearson correlations */
+    for (int i = 0; i < CM_N; i++) {
+        cm_corr[i][i] = 1.0f;
+        for (int j = i + 1; j < CM_N; j++) {
+            if (stddev[i] < 1e-12f || stddev[j] < 1e-12f) {
+                cm_corr[i][j] = cm_corr[j][i] = 0.0f;
+                continue;
+            }
+            double cov = 0.0;
+            for (int k = 0; k < n; k++) {
+                int idx = (cm_head - n + k + CM_WINDOW) % CM_WINDOW;
+                cov += (double)(cm_buf[idx][i] - mean[i]) * (cm_buf[idx][j] - mean[j]);
+            }
+            float r = (float)(cov / n / ((double)stddev[i] * stddev[j]));
+            if (r > 1.0f) r = 1.0f;
+            if (r < -1.0f) r = -1.0f;
+            cm_corr[i][j] = r;
+            cm_corr[j][i] = r;
+        }
+    }
+    cm_stale = 0;
 }
 
 /* Forward declarations for emitter/absorber use */
@@ -2635,6 +2728,7 @@ static void demo_reset_overlays(void) {
     ising_mode = 0;
     pb_mode = 0;
     pp_mode = 0;
+    cm_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -6875,6 +6969,7 @@ static void split_ensure_computed(int idx) {
         case 21: if (perc_stale) perc_compute(); break;
         case 22: if (ising_stale) ising_compute(); break;
         case 23: if (pb_stale) pb_compute(); break;
+        case 24: if (cm_stale && cm_count >= 4) cm_compute(); break;
         default: break;
     }
 }
@@ -8825,6 +8920,14 @@ static void render(int running, int speed_ms, int draw_mode) {
                  pp_metric_table[pp_y_metric].name);
     }
 
+    /* Correlation matrix indicator */
+    char cm_str[96] = "";
+    if (cm_mode) {
+        snprintf(cm_str, sizeof(cm_str),
+                 " \033[38;2;220;80;80m\xe2\x96\xa6" "CORR:%d/%d\033[0m",
+                 cm_count, CM_WINDOW);
+    }
+
     /* Split-screen indicator */
     char split_str[128] = "";
     if (split_mode) {
@@ -8971,9 +9074,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -13117,6 +13220,199 @@ static void render(int running, int speed_ms, int draw_mode) {
         #undef PP_DH
     }
 
+    /* ── Metric Correlation Matrix overlay panel ──────────────────────────── */
+    if (cm_mode && cm_count >= 4) {
+        int cm_pw = 56;  /* panel width */
+        int cm_col = term_cols - cm_pw - 2;
+        int cm_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)  cm_row += 8;
+        if (temp_mode)     cm_row += 9;
+        if (lyapunov_mode) cm_row += 8;
+        if (fourier_mode)  cm_row += 18;
+        if (fractal_mode)  cm_row += 11;
+        if (wolfram_mode)  cm_row += 14;
+        if (flow_mode)     cm_row += 9;
+        if (attractor_mode) cm_row += 7;
+        if (cone_mode)     cm_row += 12;
+        if (surp_mode)     cm_row += 8;
+        if (mi_mode)       cm_row += 8;
+        if (cplx_mode)     cm_row += 8;
+        if (topo_mode)     cm_row += 10;
+        if (rg_mode)       cm_row += 12;
+        if (kc_mode)       cm_row += 11;
+        if (corr_mode)     cm_row += 10;
+        if (eprod_mode)    cm_row += 8;
+        if (vort_mode)     cm_row += 8;
+        if (wave_mode)     cm_row += 8;
+        if (ergo_mode)     cm_row += 10;
+        if (perc_mode)     cm_row += 10;
+        if (ising_mode)    cm_row += 10;
+        if (pb_mode)       cm_row += 14;
+        if (pp_mode)       cm_row += 18;
+        if (cm_col < 1) cm_col = 1;
+
+        const char *cbdr = "\033[38;2;220;80;80;48;2;12;6;8m";
+        const char *cbg  = "\033[48;2;12;6;8m";
+        const char *crst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Correlation Matrix ",
+                     cm_row, cm_col, cbdr);
+        for (int i = 22; i < cm_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", crst);
+
+        /* Row 1: Window info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cm_row + 1, cm_col, cbdr, cbg);
+        {
+            int n = sprintf(p, " \033[38;2;220;160;140mWindow: %d/%d frames  "
+                               "\033[38;2;140;100;90m[\xe2\x80\x99]toggle",
+                            cm_count, CM_WINDOW);
+            p += n;
+            int used = 30 + (cm_count >= 10 ? 1 : 0) + (cm_count >= 100 ? 1 : 0);
+            for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Row 2: Column header (abbreviated metric names) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cm_row + 2, cm_col, cbdr, cbg);
+        p += sprintf(p, " \033[38;2;160;120;100m      ");
+        /* Print first letter of each metric as column header */
+        for (int j = 0; j < CM_N; j++) {
+            p += sprintf(p, "\033[38;2;180;140;120m%c ", pp_metric_table[j].name[0]);
+        }
+        {
+            int used = 7 + CM_N * 2;
+            for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Rows 3..3+CM_N-1: Heatmap grid */
+        for (int i = 0; i < CM_N; i++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cm_row + 3 + i, cm_col, cbdr, cbg);
+            /* Row label: first 5 chars of metric name */
+            p += sprintf(p, " \033[38;2;180;140;120m%-5.5s ", pp_metric_table[i].name);
+            /* Heatmap cells */
+            for (int j = 0; j < CM_N; j++) {
+                float r = cm_corr[i][j];
+                /* Color: blue(-1) → white(0) → red(+1) */
+                int cr, cg, cb;
+                if (r >= 0) {
+                    /* white to red */
+                    float t = r;
+                    cr = 255;
+                    cg = (int)(255 * (1.0f - t));
+                    cb = (int)(255 * (1.0f - t));
+                } else {
+                    /* white to blue */
+                    float t = -r;
+                    cr = (int)(255 * (1.0f - t));
+                    cg = (int)(255 * (1.0f - t));
+                    cb = 255;
+                }
+                if (cr < 0) cr = 0; if (cr > 255) cr = 255;
+                if (cg < 0) cg = 0; if (cg > 255) cg = 255;
+                if (cb < 0) cb = 0; if (cb > 255) cb = 255;
+                /* Use block char with bg color for heatmap cell (2 chars wide) */
+                p += sprintf(p, "\033[48;2;%d;%d;%dm  ", cr, cg, cb);
+                p += sprintf(p, "%s", cbg);
+            }
+            {
+                int used = 7 + CM_N * 2;
+                for (int i2 = used; i2 < cm_pw - 1; i2++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+        }
+
+        /* Separator line */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cm_row + 3 + CM_N, cm_col, cbdr, cbg);
+        p += sprintf(p, " \033[38;2;100;60;60m");
+        for (int i = 1; i < cm_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Find strongest positive (off-diagonal) and strongest negative pairs */
+        float best_pos = -2.0f, best_neg = 2.0f;
+        int bp_i = 0, bp_j = 1, bn_i = 0, bn_j = 1;
+        for (int i = 0; i < CM_N; i++) {
+            for (int j = i + 1; j < CM_N; j++) {
+                if (cm_corr[i][j] > best_pos) {
+                    best_pos = cm_corr[i][j]; bp_i = i; bp_j = j;
+                }
+                if (cm_corr[i][j] < best_neg) {
+                    best_neg = cm_corr[i][j]; bn_i = i; bn_j = j;
+                }
+            }
+        }
+
+        /* Find most independent pair (closest to 0) */
+        float best_ind = 2.0f;
+        int bi_i = 0, bi_j = 1;
+        for (int i = 0; i < CM_N; i++) {
+            for (int j = i + 1; j < CM_N; j++) {
+                float a = cm_corr[i][j] < 0 ? -cm_corr[i][j] : cm_corr[i][j];
+                if (a < best_ind) {
+                    best_ind = a; bi_i = i; bi_j = j;
+                }
+            }
+        }
+
+        /* Row: Strongest positive */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cm_row + 4 + CM_N, cm_col, cbdr, cbg);
+        {
+            int n = sprintf(p, " \033[38;2;255;100;100m\xe2\x96\xb2 Most correlated: "
+                               "\033[38;2;255;200;200m%s\xc3\x97%s \033[38;2;255;120;120m%.3f",
+                            pp_metric_table[bp_i].name, pp_metric_table[bp_j].name, best_pos);
+            p += n;
+            /* Estimate visible chars */
+            int used = 20 + (int)strlen(pp_metric_table[bp_i].name) + 1
+                     + (int)strlen(pp_metric_table[bp_j].name) + 7;
+            for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Row: Strongest negative */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cm_row + 5 + CM_N, cm_col, cbdr, cbg);
+        {
+            int n = sprintf(p, " \033[38;2;100;100;255m\xe2\x96\xbc Anti-correlated: "
+                               "\033[38;2;200;200;255m%s\xc3\x97%s \033[38;2;120;120;255m%.3f",
+                            pp_metric_table[bn_i].name, pp_metric_table[bn_j].name, best_neg);
+            p += n;
+            int used = 20 + (int)strlen(pp_metric_table[bn_i].name) + 1
+                     + (int)strlen(pp_metric_table[bn_j].name) + 7;
+            for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Row: Most independent */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cm_row + 6 + CM_N, cm_col, cbdr, cbg);
+        {
+            int n = sprintf(p, " \033[38;2;200;200;200m\xe2\x97\x87 Independent:     "
+                               "\033[38;2;220;220;220m%s\xc3\x97%s \033[38;2;160;160;160m%.3f",
+                            pp_metric_table[bi_i].name, pp_metric_table[bi_j].name,
+                            cm_corr[bi_i][bi_j]);
+            p += n;
+            int used = 20 + (int)strlen(pp_metric_table[bi_i].name) + 1
+                     + (int)strlen(pp_metric_table[bi_j].name) + 7;
+            for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94",
+                     cm_row + 7 + CM_N, cm_col, cbdr);
+        for (int i = 0; i < cm_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", crst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
@@ -14227,6 +14523,17 @@ int main(int argc, char **argv) {
                 printf("\033[2J"); fflush(stdout);
             }
         }
+        else if (key == '\'') {
+            cm_mode = !cm_mode;
+            if (cm_mode) {
+                cm_reset();
+                flash_set("Correlation Matrix: 16" "\xc3\x97" "16 metric correlations [']exit");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                flash_set("Correlation Matrix off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
         else if (key == '\\') {
             split_mode = !split_mode;
             if (split_mode) {
@@ -14812,6 +15119,14 @@ int main(int argc, char **argv) {
         /* Phase portrait: record metric pair every 2 generations */
         if (pp_mode && running && (generation % 2 == 0)) {
             pp_record();
+        }
+
+        /* Correlation matrix: record all metrics every 2 generations */
+        if (cm_mode && running && (generation % 2 == 0)) {
+            cm_record();
+            if (cm_stale && cm_count >= 4) {
+                cm_compute();
+            }
         }
 
         render(running, speed_ms, draw_mode);
