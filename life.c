@@ -85,6 +85,9 @@
  *                 Green=ergodic (averages match), magenta=non-ergodic (frozen)
  *   |           Toggle percolation analysis (cluster connectivity)
  *                 Gold=largest cluster, spectrum=others; detects spanning clusters
+ *   :           Toggle topological persistence barcode (feature lifetime tracking)
+ *                 Colors cells by age of their component; sidebar shows barcode diagram
+ *                 Long bars = stable structures, short bars = ephemeral noise
  *   ;           Toggle Hamiltonian energy landscape (Ising spin analogy)
  *                 Maps alive/dead → spin ±1; H = -s·Σs_neighbors
  *                 Blue=energy well (stable), red=frustrated (domain wall)
@@ -693,6 +696,56 @@ static float ising_hist_mag[ISING_HIST_LEN];
 static int   ising_hist_idx = 0;
 static int   ising_hist_count = 0;
 
+/* ── Topological Persistence Barcode ──────────────────────────────────────── */
+/* Tracks birth and death of connected components (β₀) across generations.
+   Each component is matched frame-to-frame via spatial overlap.
+   A "bar" = one feature's lifetime: birth_gen → death_gen (or still alive).
+   Long bars = structurally stable features (still lifes, oscillator cores).
+   Short bars = ephemeral noise.  Toggle with ':' key.
+   Sidebar renders a persistence barcode diagram + statistics. */
+
+#define PB_MAX_BARS 256       /* max tracked features (ring buffer) */
+#define PB_MAX_ACTIVE 512     /* max simultaneously active components */
+#define PB_HIST_LEN 64        /* sparkline history */
+
+typedef struct {
+    int birth;                /* generation when feature appeared */
+    int death;                /* generation when feature disappeared (-1 = still alive) */
+    int peak_size;            /* max size reached during lifetime */
+    unsigned short hue;       /* display hue (inherited from first label) */
+} PersistBar;
+
+static PersistBar pb_bars[PB_MAX_BARS];
+static int   pb_n_bars = 0;          /* total bars written (may exceed PB_MAX_BARS) */
+static int   pb_mode = 0;
+static int   pb_stale = 1;
+
+/* Previous frame's component tracking for matching */
+static unsigned short pb_prev_label[MAX_H][MAX_W];  /* previous frame labels */
+static int   pb_prev_n_comp = 0;                     /* previous frame component count */
+static int   pb_prev_comp_size[TOPO_MAX_COMPONENTS]; /* previous component sizes */
+static int   pb_active_birth[PB_MAX_ACTIVE];         /* birth gen of each active component */
+static int   pb_active_size[PB_MAX_ACTIVE];          /* peak size of each active component */
+static unsigned short pb_active_hue[PB_MAX_ACTIVE];  /* hue of each active component */
+static int   pb_n_active = 0;                        /* number of active components */
+static int   pb_initialized = 0;                     /* 0 until first frame processed */
+
+/* Statistics */
+static int   pb_alive_count = 0;     /* currently living features */
+static float pb_mean_lifetime = 0.0f; /* mean lifetime of dead features */
+static int   pb_max_lifetime = 0;    /* longest bar ever */
+static int   pb_total_born = 0;      /* total features born */
+static int   pb_total_died = 0;      /* total features died */
+
+/* Sparkline history */
+static int   pb_hist_alive[PB_HIST_LEN];   /* active features per frame */
+static int   pb_hist_born[PB_HIST_LEN];    /* births per frame */
+static int   pb_hist_idx = 0;
+static int   pb_hist_count = 0;
+
+/* Per-cell persistence value for overlay coloring */
+static float pb_cell_age[MAX_H][MAX_W];  /* normalized age of component this cell belongs to */
+
 /* ── Spacetime Kymograph ─────────────────────────────────────────────────── */
 /* Displays a 1D horizontal slice of the grid evolving over time as a 2D
    spacetime diagram.  Y-axis = time (scrolling upward), X-axis = grid row.
@@ -728,7 +781,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with ')' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 23
+#define N_SPLIT_OVERLAYS 24
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -758,6 +811,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Census",        'v' },  /* 20 */
     { "Percolation",   '|' },  /* 21 */
     { "Ising",         ';' },  /* 22 */
+    { "Persistence",   ':' },  /* 23 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -814,7 +868,7 @@ static void split_set_overlay(int idx) {
     surp_mode = 0; mi_mode = 0; cplx_mode = 0; topo_mode = 0;
     rg_mode = 0; kc_mode = 0; corr_mode = 0; eprod_mode = 0;
     wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
-    perc_mode = 0; ising_mode = 0;
+    perc_mode = 0; ising_mode = 0; pb_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -840,6 +894,7 @@ static void split_set_overlay(int idx) {
         case 20: census_mode = 1; break;
         case 21: perc_mode = 1; break;
         case 22: ising_mode = 1; break;
+        case 23: pb_mode = 1; break;
     }
 }
 
@@ -866,6 +921,7 @@ static int split_detect_current(void) {
     if (census_mode) return 20;
     if (perc_mode) return 21;
     if (ising_mode) return 22;
+    if (pb_mode) return 23;
     return 0;
 }
 
@@ -1550,6 +1606,16 @@ static void grid_clear(void) {
     ergo_equil_gen = -1;
     ergo_hist_count = 0;
     ergo_hist_idx = 0;
+    /* Reset persistence barcode tracking */
+    pb_initialized = 0;
+    pb_n_bars = 0;
+    pb_n_active = 0;
+    pb_total_born = 0;
+    pb_total_died = 0;
+    pb_max_lifetime = 0;
+    pb_mean_lifetime = 0.0f;
+    pb_hist_count = 0;
+    pb_hist_idx = 0;
 }
 
 static void zones_clear(void) {
@@ -1777,6 +1843,7 @@ static void grid_step(void) {
     vort_stale = 1;
     ergo_stale = 1;
     perc_stale = 1;
+    pb_stale = 1;
     ising_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
@@ -2448,6 +2515,7 @@ static void vort_compute(void);
 static void ergo_compute(void);
 static void perc_compute(void);
 static void ising_compute(void);
+static void pb_compute(void);
 
 static void demo_reset_overlays(void) {
     freq_mode = 0;
@@ -2468,6 +2536,7 @@ static void demo_reset_overlays(void) {
     ergo_mode = 0;
     perc_mode = 0;
     ising_mode = 0;
+    pb_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -2533,6 +2602,7 @@ static void demo_setup_scene(int idx) {
             case '(': ergo_mode = 1; ergo_compute(); break;
             case '|': perc_mode = 1; perc_compute(); break;
             case ';': ising_mode = 1; ising_compute(); break;
+            case ':': pb_mode = 1; pb_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -6004,6 +6074,198 @@ static RGB ising_to_rgb(float H_norm) {
     }
 }
 
+/* ── Topological Persistence Barcode computation ─────────────────────────── */
+/* Each generation: label connected components, match to previous frame via
+   spatial overlap, track birth/death of each feature across time. */
+
+static void pb_compute(void) {
+    /* We piggyback on topo_compute for current-frame component labels.
+       Call it if stale (it's cheap enough and we need the labels). */
+    if (topo_stale) topo_compute();
+
+    int cur_n = topo_beta0;  /* current frame component count */
+    if (cur_n > PB_MAX_ACTIVE) cur_n = PB_MAX_ACTIVE;
+    if (cur_n > TOPO_MAX_COMPONENTS) cur_n = TOPO_MAX_COMPONENTS;
+
+    int gen = generation;
+    int births_this_frame = 0;
+
+    if (!pb_initialized) {
+        /* First frame: all components are born now */
+        pb_n_active = cur_n;
+        for (int i = 0; i < cur_n; i++) {
+            pb_active_birth[i] = gen;
+            pb_active_size[i] = topo_comp_size[i];
+            pb_active_hue[i] = topo_comp_hue[i];
+        }
+        births_this_frame = cur_n;
+        /* Save current labels as previous */
+        memcpy(pb_prev_label, topo_label, sizeof(unsigned short) * H * MAX_W);
+        pb_prev_n_comp = cur_n;
+        memcpy(pb_prev_comp_size, topo_comp_size, sizeof(int) * cur_n);
+        pb_initialized = 1;
+    } else {
+        /* Match current components to previous via overlap.
+           For each current component, find which previous component has
+           the most overlapping cells. */
+        static int match_cur_to_prev[PB_MAX_ACTIVE]; /* cur comp i → prev comp j (-1=new) */
+        static int match_prev_used[PB_MAX_ACTIVE];   /* prev comp j already claimed? */
+        /* Overlap matrix: count shared cells between cur comp i and prev comp j.
+           Use a compact approach: iterate cells, accumulate overlaps. */
+        static int overlap[64][64]; /* only track top 64x64 for perf */
+        int max_match = cur_n < 64 ? cur_n : 64;
+        int prev_match = pb_prev_n_comp < 64 ? pb_prev_n_comp : 64;
+
+        memset(overlap, 0, sizeof(int) * max_match * 64);
+        memset(match_prev_used, 0, sizeof(int) * prev_match);
+        for (int i = 0; i < cur_n; i++) match_cur_to_prev[i] = -1;
+
+        /* Accumulate overlaps by scanning cells */
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int cur_lbl = topo_label[y][x];
+                int prev_lbl = pb_prev_label[y][x];
+                if (cur_lbl > 0 && prev_lbl > 0 &&
+                    cur_lbl <= max_match && prev_lbl <= prev_match) {
+                    overlap[cur_lbl - 1][prev_lbl - 1]++;
+                }
+            }
+        }
+
+        /* Greedy matching: for each current component, pick best prev match */
+        for (int i = 0; i < max_match; i++) {
+            int best_j = -1, best_ov = 0;
+            for (int j = 0; j < prev_match; j++) {
+                if (!match_prev_used[j] && overlap[i][j] > best_ov) {
+                    best_ov = overlap[i][j];
+                    best_j = j;
+                }
+            }
+            /* Require at least 1 cell overlap to match */
+            if (best_j >= 0 && best_ov >= 1) {
+                match_cur_to_prev[i] = best_j;
+                match_prev_used[best_j] = 1;
+            }
+        }
+
+        /* Build new active list */
+        static int new_birth[PB_MAX_ACTIVE];
+        static int new_size[PB_MAX_ACTIVE];
+        static unsigned short new_hue[PB_MAX_ACTIVE];
+
+        for (int i = 0; i < cur_n && i < PB_MAX_ACTIVE; i++) {
+            int j = (i < max_match) ? match_cur_to_prev[i] : -1;
+            if (j >= 0 && j < pb_n_active) {
+                /* Continuation of previous feature */
+                new_birth[i] = pb_active_birth[j];
+                int sz = topo_comp_size[i];
+                new_size[i] = sz > pb_active_size[j] ? sz : pb_active_size[j];
+                new_hue[i] = pb_active_hue[j];
+            } else {
+                /* New feature born this frame */
+                new_birth[i] = gen;
+                new_size[i] = topo_comp_size[i];
+                new_hue[i] = topo_comp_hue[i];
+                births_this_frame++;
+            }
+        }
+
+        /* Record deaths: previous components not matched → died */
+        for (int j = 0; j < pb_prev_n_comp && j < prev_match; j++) {
+            if (!match_prev_used[j] && j < pb_n_active) {
+                /* This feature died */
+                int bar_idx = pb_n_bars % PB_MAX_BARS;
+                pb_bars[bar_idx].birth = pb_active_birth[j];
+                pb_bars[bar_idx].death = gen;
+                pb_bars[bar_idx].peak_size = pb_active_size[j];
+                pb_bars[bar_idx].hue = pb_active_hue[j];
+                pb_n_bars++;
+                pb_total_died++;
+
+                int lt = gen - pb_active_birth[j];
+                if (lt > pb_max_lifetime) pb_max_lifetime = lt;
+            }
+        }
+
+        /* Copy new active state */
+        int new_n = cur_n < PB_MAX_ACTIVE ? cur_n : PB_MAX_ACTIVE;
+        memcpy(pb_active_birth, new_birth, sizeof(int) * new_n);
+        memcpy(pb_active_size, new_size, sizeof(int) * new_n);
+        memcpy(pb_active_hue, new_hue, sizeof(unsigned short) * new_n);
+        pb_n_active = new_n;
+
+        /* Save current labels as previous for next frame */
+        memcpy(pb_prev_label, topo_label, sizeof(unsigned short) * H * MAX_W);
+        pb_prev_n_comp = cur_n;
+        memcpy(pb_prev_comp_size, topo_comp_size, sizeof(int) * cur_n);
+    }
+
+    pb_total_born += births_this_frame;
+    pb_alive_count = pb_n_active;
+
+    /* Compute mean lifetime of dead features */
+    if (pb_total_died > 0) {
+        int n_bars = pb_n_bars < PB_MAX_BARS ? pb_n_bars : PB_MAX_BARS;
+        float sum_lt = 0;
+        int count_dead = 0;
+        for (int i = 0; i < n_bars; i++) {
+            if (pb_bars[i].death >= 0) {
+                sum_lt += (float)(pb_bars[i].death - pb_bars[i].birth);
+                count_dead++;
+            }
+        }
+        pb_mean_lifetime = count_dead > 0 ? sum_lt / count_dead : 0.0f;
+    }
+
+    /* Compute per-cell persistence age for overlay coloring */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int lbl = topo_label[y][x];
+            if (lbl > 0 && lbl <= pb_n_active) {
+                int age = gen - pb_active_birth[lbl - 1];
+                /* Normalize: 0 = just born, 1 = old (50+ gens) */
+                float a = (float)age / 50.0f;
+                if (a > 1.0f) a = 1.0f;
+                pb_cell_age[y][x] = a;
+            } else {
+                pb_cell_age[y][x] = 0.0f;
+            }
+        }
+    }
+
+    /* Sparkline history */
+    pb_hist_alive[pb_hist_idx] = pb_alive_count;
+    pb_hist_born[pb_hist_idx] = births_this_frame;
+    pb_hist_idx = (pb_hist_idx + 1) % PB_HIST_LEN;
+    if (pb_hist_count < PB_HIST_LEN) pb_hist_count++;
+
+    pb_stale = 0;
+}
+
+/* Persistence age to RGB:
+   Young features (just born): bright cyan/white.
+   Aging features: transition through green → yellow → gold.
+   Ancient features (long-lived): deep amber/warm orange = "persistent". */
+static RGB pb_age_to_rgb(float age_norm) {
+    if (age_norm < 0.2f) {
+        /* Newborn: white → cyan */
+        float t = age_norm / 0.2f;
+        return (RGB){(unsigned char)(220 - 120 * t), (unsigned char)(240 - 20 * t), (unsigned char)(255)};
+    } else if (age_norm < 0.5f) {
+        /* Young: cyan → green */
+        float t = (age_norm - 0.2f) / 0.3f;
+        return (RGB){(unsigned char)(100 - 80 * t), (unsigned char)(220 - 40 * t), (unsigned char)(255 - 155 * t)};
+    } else if (age_norm < 0.8f) {
+        /* Mature: green → gold */
+        float t = (age_norm - 0.5f) / 0.3f;
+        return (RGB){(unsigned char)(20 + 200 * t), (unsigned char)(180 + 40 * t), (unsigned char)(100 - 60 * t)};
+    } else {
+        /* Ancient: gold → warm amber */
+        float t = (age_norm - 0.8f) / 0.2f;
+        return (RGB){(unsigned char)(220 + 35 * t), (unsigned char)(220 - 60 * t), (unsigned char)(40 - 20 * t)};
+    }
+}
+
 /* ── Wave Mechanics computation ───────────────────────────────────────────── */
 /* Damped 2D wave equation: d²u/dt² = c²∇²u - γ du/dt + S(x,y,t)
    where S = impulses from cell births (+) and deaths (-).
@@ -6514,6 +6776,7 @@ static void split_ensure_computed(int idx) {
         case 20: if (census_stale) census_scan(); break;
         case 21: if (perc_stale) perc_compute(); break;
         case 22: if (ising_stale) ising_compute(); break;
+        case 23: if (pb_stale) pb_compute(); break;
         default: break;
     }
 }
@@ -8110,6 +8373,23 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Topological persistence barcode overlay */
+    if (pb_mode) {
+        float age = pb_cell_age[y][x];
+        if (grid[y][x]) {
+            *out = pb_age_to_rgb(age);
+            return 1;
+        }
+        if (age > 0.01f) {
+            RGB c = pb_age_to_rgb(age);
+            out->r = c.r / 5;
+            out->g = c.g / 5;
+            out->b = c.b / 5;
+            return 30; /* persistence ghost */
+        }
+        return 0;
+    }
+
     /* Hamiltonian energy landscape (Ising analogy) overlay */
     if (ising_mode) {
         float H = ising_energy[y][x];
@@ -8639,7 +8919,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     int split_saved_surp, split_saved_mi, split_saved_cplx, split_saved_topo;
     int split_saved_rg, split_saved_kc, split_saved_corr, split_saved_eprod;
     int split_saved_wave, split_saved_vort, split_saved_ergo, split_saved_census;
-    int split_saved_perc, split_saved_ising;
+    int split_saved_perc, split_saved_ising, split_saved_pb;
     int split_mid = view_w / 2; /* column divider position */
 
     if (split_mode) {
@@ -8656,6 +8936,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         split_saved_ergo = ergo_mode; split_saved_census = census_mode;
         split_saved_perc = perc_mode;
         split_saved_ising = ising_mode;
+        split_saved_pb = pb_mode;
 
         /* Ensure data is computed for both panels */
         split_ensure_computed(split_left);
@@ -8913,6 +9194,7 @@ static void render(int running, int speed_ms, int draw_mode) {
             ergo_mode = split_saved_ergo; census_mode = split_saved_census;
             perc_mode = split_saved_perc;
             ising_mode = split_saved_ising;
+            pb_mode = split_saved_pb;
         } else {
         /* Normal (non-split) rendering */
         for (int row = 0; row < usable_rows && row < view_h; row++) {
@@ -12299,6 +12581,217 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", isrst);
     }
 
+    /* ── Topological Persistence Barcode overlay panel ──────────────────── */
+    if (pb_mode) {
+        int pb_w = 46;
+        int pb_col = term_cols - pb_w - 2;
+        int pb_row = 3;
+        if (entropy_mode)   pb_row += 8;
+        if (temp_mode)      pb_row += 9;
+        if (lyapunov_mode)  pb_row += 8;
+        if (fourier_mode)   pb_row += 18;
+        if (fractal_mode)   pb_row += 11;
+        if (wolfram_mode)   pb_row += 14;
+        if (flow_mode)      pb_row += 9;
+        if (attractor_mode) pb_row += 8;
+        if (cone_mode >= 1) pb_row += 8;
+        if (surp_mode)      pb_row += 8;
+        if (mi_mode)        pb_row += 12;
+        if (cplx_mode)      pb_row += 11;
+        if (topo_mode)      pb_row += 11;
+        if (rg_mode)        pb_row += 11;
+        if (kc_mode)        pb_row += 9;
+        if (corr_mode)      pb_row += 9;
+        if (eprod_mode)     pb_row += 9;
+        if (vort_mode)      pb_row += 9;
+        if (wave_mode)      pb_row += 9;
+        if (ergo_mode)      pb_row += 10;
+        if (perc_mode)      pb_row += 10;
+        if (ising_mode)     pb_row += 10;
+        if (pb_col < 1) pb_col = 1;
+
+        const char *pbbdr = "\033[38;2;200;160;80;48;2;10;8;5m";
+        const char *pbbg  = "\033[48;2;10;8;5m";
+        const char *pbrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x8f\xb3 Persistence Barcode ",
+                     pb_row, pb_col, pbbdr);
+        for (int i = 25; i < pb_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", pbrst);
+
+        /* Row 1: Active features & total born/died */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pb_row + 1, pb_col, pbbdr, pbbg);
+        p += sprintf(p, " \033[38;2;200;180;100mAlive:");
+        p += sprintf(p, "\033[38;2;100;220;200m%d", pb_alive_count);
+        p += sprintf(p, "\033[38;2;120;120;80m  born:");
+        p += sprintf(p, "\033[38;2;180;220;180m%d", pb_total_born);
+        p += sprintf(p, "\033[38;2;120;120;80m  died:");
+        p += sprintf(p, "\033[38;2;220;140;120m%d", pb_total_died);
+        p += sprintf(p, "%s", pbbg);
+        { int used = 36; for (int i = used; i < pb_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pbbdr, pbrst);
+
+        /* Row 2: Mean lifetime & max lifetime */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pb_row + 2, pb_col, pbbdr, pbbg);
+        p += sprintf(p, " \033[38;2;200;180;100m\xc2\xb5" "life:");
+        p += sprintf(p, "\033[38;2;220;200;100m%.1f", pb_mean_lifetime);
+        p += sprintf(p, "\033[38;2;120;120;80m  max:");
+        p += sprintf(p, "\033[38;2;255;200;60m%d", pb_max_lifetime);
+        p += sprintf(p, "\033[38;2;120;120;80m gens");
+        p += sprintf(p, "%s", pbbg);
+        { int used = 30; for (int i = used; i < pb_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pbbdr, pbrst);
+
+        /* Row 3: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pb_row + 3, pb_col, pbbdr, pbbg);
+        p += sprintf(p, " \033[38;2;220;240;255m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;100;220;255m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;20;180;100m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;80;80;60mnew");
+        p += sprintf(p, "  \033[38;2;220;220;40m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;255;160;20m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;180;100;40mold");
+        p += sprintf(p, "%s", pbbg);
+        { int used = 20; for (int i = used; i < pb_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pbbdr, pbrst);
+
+        /* Row 4: Active features sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pb_row + 4, pb_col, pbbdr, pbbg);
+        p += sprintf(p, " \033[38;2;120;100;60m\xce\xb2\xe2\x82\x80 ");
+        if (pb_hist_count > 1) {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int n = pb_hist_count < 30 ? pb_hist_count : 30;
+            int vmax = 1;
+            for (int i = 0; i < n; i++) {
+                int idx = (pb_hist_idx - n + i + PB_HIST_LEN) % PB_HIST_LEN;
+                if (pb_hist_alive[idx] > vmax) vmax = pb_hist_alive[idx];
+            }
+            for (int i = 0; i < n; i++) {
+                int idx = (pb_hist_idx - n + i + PB_HIST_LEN) % PB_HIST_LEN;
+                float v = (float)pb_hist_alive[idx] / (float)vmax;
+                int lvl = (int)(v * 7.0f);
+                if (lvl > 7) lvl = 7;
+                p += sprintf(p, "\033[38;2;%d;%d;60m%s",
+                    100 + (int)(v * 155), 180 - (int)(v * 80), spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", pbbg);
+        { int used = 3 + (pb_hist_count < 30 ? pb_hist_count : 30);
+          for (int i = used; i < pb_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pbbdr, pbrst);
+
+        /* Rows 5-11: Persistence barcode diagram — show longest bars */
+        int barcode_rows = 7;
+        /* Collect bars to display: alive features sorted by lifetime (longest first) */
+        static struct { int lifetime; int idx; int alive; } bar_display[PB_MAX_BARS];
+        int n_display = 0;
+        /* Add alive features */
+        for (int i = 0; i < pb_n_active && n_display < PB_MAX_BARS; i++) {
+            bar_display[n_display].lifetime = generation - pb_active_birth[i];
+            bar_display[n_display].idx = i;
+            bar_display[n_display].alive = 1;
+            n_display++;
+        }
+        /* Add dead features (from ring buffer) */
+        int n_dead = pb_n_bars < PB_MAX_BARS ? pb_n_bars : PB_MAX_BARS;
+        for (int i = 0; i < n_dead && n_display < PB_MAX_BARS; i++) {
+            if (pb_bars[i].death >= 0) {
+                bar_display[n_display].lifetime = pb_bars[i].death - pb_bars[i].birth;
+                bar_display[n_display].idx = i;
+                bar_display[n_display].alive = 0;
+                n_display++;
+            }
+        }
+        /* Simple selection sort for top barcode_rows entries by lifetime desc */
+        for (int i = 0; i < barcode_rows && i < n_display; i++) {
+            int best = i;
+            for (int j = i + 1; j < n_display; j++) {
+                if (bar_display[j].lifetime > bar_display[best].lifetime)
+                    best = j;
+            }
+            if (best != i) {
+                int tl = bar_display[i].lifetime, ti = bar_display[i].idx, ta = bar_display[i].alive;
+                bar_display[i].lifetime = bar_display[best].lifetime;
+                bar_display[i].idx = bar_display[best].idx;
+                bar_display[i].alive = bar_display[best].alive;
+                bar_display[best].lifetime = tl;
+                bar_display[best].idx = ti;
+                bar_display[best].alive = ta;
+            }
+        }
+
+        int max_lt = 1;
+        for (int i = 0; i < barcode_rows && i < n_display; i++) {
+            if (bar_display[i].lifetime > max_lt) max_lt = bar_display[i].lifetime;
+        }
+
+        int bar_w = pb_w - 10; /* width for bar rendering */
+        for (int row = 0; row < barcode_rows; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         pb_row + 5 + row, pb_col, pbbdr, pbbg);
+            if (row < n_display) {
+                int lt = bar_display[row].lifetime;
+                int is_alive = bar_display[row].alive;
+                /* Bar length proportional to lifetime */
+                int bar_len = (int)((float)lt / (float)max_lt * (float)(bar_w - 1));
+                if (bar_len < 1 && lt > 0) bar_len = 1;
+                if (bar_len > bar_w - 1) bar_len = bar_w - 1;
+
+                /* Age coloring for the bar */
+                float age_frac = (float)lt / 50.0f;
+                if (age_frac > 1.0f) age_frac = 1.0f;
+                RGB bar_color = pb_age_to_rgb(age_frac);
+
+                p += sprintf(p, " \033[38;2;%d;%d;%dm", bar_color.r, bar_color.g, bar_color.b);
+                for (int b = 0; b < bar_len; b++) {
+                    *p++ = '\xe2'; *p++ = '\x96'; *p++ = '\x88'; /* ▇ full block */
+                }
+                if (is_alive) {
+                    /* Arrow for still-alive features */
+                    p += sprintf(p, "\033[38;2;255;255;200m\xe2\x96\xb6");
+                } else {
+                    p += sprintf(p, "\033[38;2;100;60;40m\xe2\x94\x82");
+                }
+                /* Lifetime label */
+                int label_pos = bar_len + 2;
+                int remaining = pb_w - 1 - label_pos;
+                if (remaining > 6) {
+                    p += sprintf(p, "\033[38;2;100;90;60m%d", lt);
+                    /* Rough count of digits for padding */
+                    int digits = lt < 10 ? 1 : lt < 100 ? 2 : lt < 1000 ? 3 : 4;
+                    for (int i = label_pos + digits; i < pb_w - 1; i++) *p++ = ' ';
+                } else {
+                    for (int i = label_pos; i < pb_w - 1; i++) *p++ = ' ';
+                }
+            } else {
+                /* Empty row */
+                for (int i = 1; i < pb_w; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", pbbdr, pbrst);
+        }
+
+        /* Row 12: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pb_row + 5 + barcode_rows, pb_col, pbbdr, pbbg);
+        p += sprintf(p, " \033[38;2;100;80;50m[:]toggle  persistent homology");
+        { int used = 35; for (int i = used; i < pb_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pbbdr, pbrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", pb_row + 6 + barcode_rows, pb_col, pbbdr);
+        for (int i = 0; i < pb_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", pbrst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
@@ -13357,6 +13850,12 @@ int main(int argc, char **argv) {
                 ising_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == ':') {
+            pb_mode = !pb_mode;
+            if (pb_mode) {
+                pb_compute();
+            }
+        }
         else if (key == 'K') {
             kymo_mode = !kymo_mode;
             if (kymo_mode) {
@@ -13938,6 +14437,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh Ising energy landscape every 2 generations */
         if (ising_mode && ising_stale && (generation % 2 == 0 || !running)) {
             ising_compute();
+        }
+
+        /* Auto-refresh persistence barcode every 2 generations */
+        if (pb_mode && pb_stale && (generation % 2 == 0 || !running)) {
+            pb_compute();
         }
 
         /* Auto-refresh wave mechanics every generation (continuous propagation) */

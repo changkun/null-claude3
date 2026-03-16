@@ -1,8 +1,24 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~13,953 lines
-(Round 51).
+features. The project grew from ~790 lines (Round 1) to ~14,457 lines
+(Round 52).
+
+## Round 52 — Topological Persistence Barcode
+
+Persistent homology meets cellular automata. Press `:` to track connected
+components across generations and visualize their lifetimes as a
+persistence barcode. Each component is matched frame-to-frame via spatial
+overlap; when it appears that's its "birth," when it vanishes its "death."
+Grid cells are colored by component age: white/cyan (newborn) → green
+(young) → gold/amber (ancient, persistent). Sidebar panel shows live
+feature count, total born/died, mean and max lifetime, β₀ sparkline,
+and a barcode diagram of the top 7 longest-lived features — long bars =
+structurally stable (still lifes, oscillator cores), short bars =
+ephemeral noise. Alive features display an arrow tip (▶), dead features
+a terminator (│). Resets automatically on grid clear/randomize. Builds
+on existing topological feature map infrastructure (round 34) with
+temporal tracking. +504 lines.
 
 ## Round 51 — Hamiltonian Energy Landscape
 
