@@ -1,8 +1,22 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~13,375 lines
-(Round 49).
+features. The project grew from ~790 lines (Round 1) to ~13,622 lines
+(Round 50).
+
+## Round 50 — Spacetime Kymograph Mode
+
+First visualization treating time as a spatial dimension. Press `K` to
+replace the normal grid view with a spacetime diagram: X-axis = space
+(one scan row), Y-axis = time (scrolling upward, newest at bottom).
+Half-block rendering (▀) packs 2 generations per terminal row. Thermal
+gradient maps cell age through blue → cyan → green → yellow → red →
+white. ↑/↓ moves the scan row (buffer resets for clean transition),
+←/→ pans horizontally. 256-deep ring buffer with zero allocations.
+Info panel shows scan row, buffer depth, row-population sparkline
+(▁▂▃▅▇█), and key hints. Classic Wolfram-style spacetime diagram —
+gliders trace diagonal worldlines, oscillators create vertical stripes,
+chaotic regions appear as textured noise. +290 lines.
 
 ## Round 49 — Percolation Analysis Overlay
 
