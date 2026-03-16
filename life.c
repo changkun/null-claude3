@@ -72,6 +72,9 @@
  *   &           Toggle spatial correlation length (two-point correlation)
  *                 Measures correlation length ξ and local correlation strength
  *                 Violet=uncorrelated, cyan=moderate, white=strongly correlated
+ *   =           Toggle entropy production rate (thermodynamic arrow of time)
+ *                 Local dS/dt: where order emerges vs dissolves
+ *                 Blue=ordering, gray=equilibrium, red=disordering
  *   D           Auto-demo mode — curated tour of pattern + overlay combos
  *                 Cycles through 10 scenes; press any key to exit and explore
  *   ?           Toggle cell probe inspector (click any cell for all metrics)
@@ -502,6 +505,31 @@ static float corr_cr[CORR_MAX_R + 1];    /* global C(r) function */
 static float corr_hist_xi[CORR_HIST_LEN];
 static int   corr_hist_idx = 0;
 static int   corr_hist_count = 0;
+
+/* ── Entropy Production Rate ──────────────────────────────────────────────── */
+/* Thermodynamic arrow of time: dS/dt per cell.  Measures the rate of local
+   entropy change by comparing current vs previous-frame local Shannon entropy.
+   Positive dS/dt = entropy increasing (structures dissolving, disorder growing).
+   Negative dS/dt = entropy decreasing (self-organization, order emerging).
+   Blue = ordering, gray = equilibrium, red = disordering. */
+#define EPROD_HIST_LEN 64     /* sparkline history length */
+#define EPROD_EMA      0.7f   /* EMA smoothing for per-cell dS/dt */
+
+static float eprod_grid[MAX_H][MAX_W];     /* per-cell dS/dt (-1..+1, smoothed) */
+static float eprod_prev[MAX_H][MAX_W];     /* previous frame's local entropy */
+static int   eprod_mode = 0;               /* 0=off, 1=on */
+static int   eprod_stale = 1;              /* 1=needs recomputation */
+static int   eprod_has_prev = 0;           /* 0=no previous frame yet */
+static float eprod_global = 0.0f;          /* mean dS/dt across grid */
+static float eprod_max_pos = 0.0f;         /* max positive dS/dt (most disordering) */
+static float eprod_max_neg = 0.0f;         /* max negative dS/dt (most ordering) */
+static float eprod_frac_pos = 0.0f;        /* fraction of cells with positive dS/dt */
+static float eprod_frac_neg = 0.0f;        /* fraction of cells with negative dS/dt */
+
+/* Sparkline history */
+static float eprod_hist[EPROD_HIST_LEN];
+static int   eprod_hist_idx = 0;
+static int   eprod_hist_count = 0;
 
 /* ── Cell Probe Inspector ─────────────────────────────────────────────────── */
 /* Click-to-inspect tool: shows all analysis metrics for a single cell.
@@ -1428,6 +1456,7 @@ static void grid_step(void) {
     rg_stale = 1;
     kc_stale = 1;
     corr_stale = 1;
+    eprod_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -2089,6 +2118,7 @@ static void topo_compute(void);
 static void rg_compute(void);
 static void kc_compute(void);
 static void corr_compute(void);
+static void eprod_compute(void);
 
 static void demo_reset_overlays(void) {
     freq_mode = 0;
@@ -2103,6 +2133,7 @@ static void demo_reset_overlays(void) {
     rg_mode = 0;
     kc_mode = 0;
     corr_mode = 0;
+    eprod_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -2160,6 +2191,7 @@ static void demo_setup_scene(int idx) {
             case '%': rg_mode = 1; rg_compute(); break;
             case '^': kc_mode = 1; kc_compute(); break;
             case '&': corr_mode = 1; corr_compute(); break;
+            case '=': eprod_mode = 1; eprod_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -4985,6 +5017,145 @@ static RGB corr_to_rgb(float c) {
     }
 }
 
+/* ── Entropy Production Rate computation ──────────────────────────────────── */
+
+/* Compute local Shannon entropy for a single cell's 3x3 neighborhood.
+   Identical to entropy_compute's per-cell logic but returns value directly. */
+static float eprod_local_entropy(int cx, int cy) {
+    static const double log2_inv = 1.4426950408889634;
+    int alive = 0, total = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = cx + dx, ny = cy + dy;
+            if (!topo_map(&nx, &ny)) continue;
+            total++;
+            if (grid[ny][nx] > 0) alive++;
+        }
+    }
+    if (total == 0) return 0.0f;
+    double p = (double)alive / (double)total;
+    if (p <= 0.0 || p >= 1.0) return 0.0f;
+    return (float)(-(p * log(p) + (1.0 - p) * log(1.0 - p)) * log2_inv);
+}
+
+static void eprod_compute(void) {
+    /* Step 1: Compute current local entropy for each cell */
+    float current[MAX_H][MAX_W];
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            current[y][x] = eprod_local_entropy(x, y);
+
+    /* Step 2: If we have a previous frame, compute dS/dt */
+    if (eprod_has_prev) {
+        double sum = 0.0;
+        float mx_pos = 0.0f, mx_neg = 0.0f;
+        int n_pos = 0, n_neg = 0, n_active = 0;
+
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                float ds = current[y][x] - eprod_prev[y][x];
+                /* EMA smoothing: blend with previous value */
+                float smoothed = EPROD_EMA * eprod_grid[y][x] + (1.0f - EPROD_EMA) * ds;
+                eprod_grid[y][x] = smoothed;
+
+                /* Stats (only count cells near activity) */
+                if (grid[y][x] > 0 || ghost[y][x] > 0 ||
+                    fabsf(current[y][x]) > 0.01f || fabsf(eprod_prev[y][x]) > 0.01f) {
+                    sum += smoothed;
+                    n_active++;
+                    if (smoothed > 0.001f) n_pos++;
+                    if (smoothed < -0.001f) n_neg++;
+                    if (smoothed > mx_pos) mx_pos = smoothed;
+                    if (smoothed < mx_neg) mx_neg = smoothed;
+                }
+            }
+        }
+
+        eprod_global = n_active > 0 ? (float)(sum / n_active) : 0.0f;
+        eprod_max_pos = mx_pos;
+        eprod_max_neg = mx_neg;
+        eprod_frac_pos = n_active > 0 ? (float)n_pos / n_active : 0.0f;
+        eprod_frac_neg = n_active > 0 ? (float)n_neg / n_active : 0.0f;
+    } else {
+        /* First frame: initialize to zero */
+        memset(eprod_grid, 0, sizeof(eprod_grid));
+        eprod_global = 0.0f;
+        eprod_max_pos = 0.0f;
+        eprod_max_neg = 0.0f;
+        eprod_frac_pos = 0.0f;
+        eprod_frac_neg = 0.0f;
+    }
+
+    /* Step 3: Save current entropy as previous for next frame */
+    memcpy(eprod_prev, current, sizeof(eprod_prev));
+    eprod_has_prev = 1;
+
+    /* Step 4: Record sparkline history */
+    eprod_hist[eprod_hist_idx] = eprod_global;
+    eprod_hist_idx = (eprod_hist_idx + 1) % EPROD_HIST_LEN;
+    if (eprod_hist_count < EPROD_HIST_LEN) eprod_hist_count++;
+
+    eprod_stale = 0;
+}
+
+/* Entropy production rate color:
+   deep blue (strong ordering) → gray (equilibrium) → deep red (strong disordering)
+   The mapping is symmetric around zero with a dead zone near equilibrium. */
+static RGB eprod_to_rgb(float ds) {
+    /* Clamp to visible range */
+    if (ds < -0.5f) ds = -0.5f;
+    if (ds > 0.5f) ds = 0.5f;
+
+    if (ds < -0.02f) {
+        /* Ordering: blue scale (negative dS/dt) */
+        float t = -ds / 0.5f; /* 0 to 1 */
+        if (t > 1.0f) t = 1.0f;
+        if (t < 0.15f) {
+            /* Faint ordering */
+            return (RGB){(unsigned char)(20 + 30 * t / 0.15f),
+                         (unsigned char)(30 + 50 * t / 0.15f),
+                         (unsigned char)(80 + 60 * t / 0.15f)};
+        } else if (t < 0.5f) {
+            /* Moderate ordering */
+            float u = (t - 0.15f) / 0.35f;
+            return (RGB){(unsigned char)(50 - 10 * u),
+                         (unsigned char)(80 + 80 * u),
+                         (unsigned char)(140 + 80 * u)};
+        } else {
+            /* Strong ordering */
+            float u = (t - 0.5f) / 0.5f;
+            return (RGB){(unsigned char)(40 + 40 * u),
+                         (unsigned char)(160 + 70 * u),
+                         (unsigned char)(220 + 35 * u)};
+        }
+    } else if (ds > 0.02f) {
+        /* Disordering: red scale (positive dS/dt) */
+        float t = ds / 0.5f; /* 0 to 1 */
+        if (t > 1.0f) t = 1.0f;
+        if (t < 0.15f) {
+            /* Faint disordering */
+            return (RGB){(unsigned char)(80 + 60 * t / 0.15f),
+                         (unsigned char)(30 + 20 * t / 0.15f),
+                         (unsigned char)(20 + 10 * t / 0.15f)};
+        } else if (t < 0.5f) {
+            /* Moderate disordering */
+            float u = (t - 0.15f) / 0.35f;
+            return (RGB){(unsigned char)(140 + 70 * u),
+                         (unsigned char)(50 + 40 * u),
+                         (unsigned char)(30 - 10 * u)};
+        } else {
+            /* Strong disordering: red → orange-white */
+            float u = (t - 0.5f) / 0.5f;
+            return (RGB){(unsigned char)(210 + 45 * u),
+                         (unsigned char)(90 + 100 * u),
+                         (unsigned char)(20 + 60 * u)};
+        }
+    } else {
+        /* Equilibrium: dark gray */
+        return (RGB){25, 25, 30};
+    }
+}
+
 /* ── Mutual Information Network computation ──────────────────────────────── */
 
 /* Draw a Bresenham line on mi_overlay, keeping max MI at each cell */
@@ -6825,6 +6996,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Entropy production rate overlay: thermodynamic arrow of time */
+    if (eprod_mode) {
+        float ds = eprod_grid[y][x];
+        if (fabsf(ds) > 0.005f || grid[y][x]) {
+            *out = eprod_to_rgb(ds);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 24; /* 24 = eprod ghost */
+        }
+        return 0;
+    }
+
     /* Renormalization group flow overlay: multi-scale structure */
     if (rg_mode) {
         if (grid[y][x]) {
@@ -7119,6 +7305,17 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(corr_str, sizeof(corr_str),
                  " \033[38;2;120;180;240m\xe2\x97\x86\xce\xbe=%.1f\033[0m", corr_xi);
 
+    /* Entropy production rate indicator */
+    char eprod_str[96] = "";
+    if (eprod_mode) {
+        const char *arrow = eprod_global > 0.005f ? "\xe2\x86\x91" :
+                            eprod_global < -0.005f ? "\xe2\x86\x93" : "\xe2\x89\x88";
+        const char *clr = eprod_global > 0.01f ? "38;2;220;80;40" :
+                          eprod_global < -0.01f ? "38;2;60;160;240" : "38;2;140;140;150";
+        snprintf(eprod_str, sizeof(eprod_str),
+                 " \033[%sm\xe2\x97\x86" "dS%s%.3f\033[0m", clr, arrow, eprod_global);
+    }
+
     /* Probe mode indicator */
     char probe_str[96] = "";
     if (probe_mode == 1)
@@ -7248,9 +7445,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -7288,7 +7485,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     } else {
         p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                          "[1-5]pre [d]draw [D]demo [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
-                         "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                         "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [=]dS/dt [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                          "[S]stamp [v]census [?]probe [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                          "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
     }
@@ -9804,10 +10001,148 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", crst);
     }
 
+    /* ── Entropy Production Rate overlay panel ─────────────────────────── */
+    if (eprod_mode) {
+        int ep_w = 44;
+        int ep_col = term_cols - ep_w - 2;
+        /* Stack below other active panels */
+        int ep_row = 3;
+        if (entropy_mode)   ep_row += 8;
+        if (temp_mode)      ep_row += 9;
+        if (lyapunov_mode)  ep_row += 8;
+        if (fourier_mode)   ep_row += 18;
+        if (fractal_mode)   ep_row += 11;
+        if (wolfram_mode)   ep_row += 14;
+        if (flow_mode)      ep_row += 9;
+        if (attractor_mode) ep_row += 8;
+        if (cone_mode >= 1) ep_row += 8;
+        if (surp_mode)      ep_row += 8;
+        if (mi_mode)        ep_row += 12;
+        if (cplx_mode)      ep_row += 11;
+        if (topo_mode)      ep_row += 11;
+        if (rg_mode)        ep_row += 11;
+        if (kc_mode)        ep_row += 9;
+        if (corr_mode)      ep_row += 9;
+        if (ep_col < 1) ep_col = 1;
+
+        const char *ebdr = "\033[38;2;180;100;60;48;2;12;8;6m";
+        const char *ebg  = "\033[48;2;12;8;6m";
+        const char *erst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 dS/dt \xe2\x97\x86 Entropy Production ",
+                     ep_row, ep_col, ebdr);
+        for (int i = 30; i < ep_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", erst);
+
+        /* Row 1: Global dS/dt */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ep_row + 1, ep_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;160;120;80mdS/dt = ");
+        if (eprod_global > 0.01f) p += sprintf(p, "\033[1;38;2;240;80;40m");
+        else if (eprod_global < -0.01f) p += sprintf(p, "\033[1;38;2;60;160;240m");
+        else p += sprintf(p, "\033[1;38;2;160;160;170m");
+        p += sprintf(p, "%+.4f", eprod_global);
+        p += sprintf(p, "\033[0;38;2;100;100;110m bits/gen");
+        p += sprintf(p, "%s", ebg);
+        { int used = 32; for (int i = used; i < ep_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 2: Ordering vs disordering fractions */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ep_row + 2, ep_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;60;160;240m\xe2\x96\xbc%.0f%%",
+                     eprod_frac_neg * 100.0f);
+        p += sprintf(p, "\033[38;2;100;100;110m order  ");
+        p += sprintf(p, "\033[38;2;240;80;40m\xe2\x96\xb2%.0f%%",
+                     eprod_frac_pos * 100.0f);
+        p += sprintf(p, "\033[38;2;100;100;110m disorder");
+        p += sprintf(p, "%s", ebg);
+        { int used = 33; for (int i = used; i < ep_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 3: Thermodynamic phase */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ep_row + 3, ep_col, ebdr, ebg);
+        {
+            const char *phase;
+            if (eprod_global > 0.05f) phase = "\033[38;2;240;80;40mdissipating";
+            else if (eprod_global > 0.01f) phase = "\033[38;2;220;160;60mheating";
+            else if (eprod_global < -0.05f) phase = "\033[38;2;60;200;255mcrystallizing";
+            else if (eprod_global < -0.01f) phase = "\033[38;2;80;160;220mordering";
+            else phase = "\033[38;2;160;160;170mequilibrium";
+            p += sprintf(p, " \033[38;2;120;100;80mPhase: %s", phase);
+        }
+        p += sprintf(p, "%s", ebg);
+        { int used = 28; for (int i = used; i < ep_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 4: Extremes */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ep_row + 4, ep_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;60;160;240mmin:%+.3f", eprod_max_neg);
+        p += sprintf(p, "  \033[38;2;240;80;40mmax:%+.3f", eprod_max_pos);
+        p += sprintf(p, "%s", ebg);
+        { int used = 28; for (int i = used; i < ep_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 5: dS/dt sparkline over time */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ep_row + 5, ep_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;120;100;80mdS ");
+        if (eprod_hist_count > 1) {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int n = eprod_hist_count < 30 ? eprod_hist_count : 30;
+            /* Find range for normalization */
+            float hmin = 0, hmax = 0;
+            for (int i = 0; i < n; i++) {
+                int idx = (eprod_hist_idx - n + i + EPROD_HIST_LEN) % EPROD_HIST_LEN;
+                if (eprod_hist[idx] < hmin) hmin = eprod_hist[idx];
+                if (eprod_hist[idx] > hmax) hmax = eprod_hist[idx];
+            }
+            float range = hmax - hmin;
+            if (range < 0.001f) range = 0.001f;
+            for (int i = 0; i < n; i++) {
+                int idx = (eprod_hist_idx - n + i + EPROD_HIST_LEN) % EPROD_HIST_LEN;
+                float v = (eprod_hist[idx] - hmin) / range;
+                int lvl = (int)(v * 7.0f);
+                if (lvl > 7) lvl = 7;
+                if (lvl < 0) lvl = 0;
+                /* Color: blue for negative, red for positive */
+                if (eprod_hist[idx] < -0.01f)
+                    p += sprintf(p, "\033[38;2;60;160;240m%s", spark_chars[lvl]);
+                else if (eprod_hist[idx] > 0.01f)
+                    p += sprintf(p, "\033[38;2;240;100;60m%s", spark_chars[lvl]);
+                else
+                    p += sprintf(p, "\033[38;2;120;120;130m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", ebg);
+        { int used = 3 + (eprod_hist_count < 30 ? eprod_hist_count : 30);
+          for (int i = used; i < ep_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 6: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ep_row + 6, ep_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;100;80;60m[=]toggle  thermodynamic arrow");
+        { int used = 35; for (int i = used; i < ep_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", ep_row + 7, ep_col, ebdr);
+        for (int i = 0; i < ep_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", erst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
-        int pp_h = 29; /* total rows including borders */
+        int pp_h = 30; /* total rows including borders */
         /* Center panel vertically, place on left side to avoid overlay panel stacking on right */
         int pp_col = 2;
         int pp_row = 3;
@@ -10036,6 +10371,22 @@ static void render(int running, int speed_ms, int draw_mode) {
             p += sprintf(p, " %s\xce\xbe=%.1f%s", pdim, corr_xi, prst);
             p += sprintf(p, "%s", pbg);
             PROBE_PAD(32);
+        }
+        PROBE_ROW_END();
+
+        /* Row 12c: Entropy Production */
+        PROBE_ROW_START();
+        {
+            float ep = eprod_grid[py][px];
+            p += sprintf(p, " %sdS/dt:%s       ", plbl, prst);
+            if (ep < -0.02f) p += sprintf(p, "\033[38;2;60;160;240m");
+            else if (ep > 0.02f) p += sprintf(p, "\033[38;2;240;80;40m");
+            else p += sprintf(p, "\033[38;2;160;160;170m");
+            p += sprintf(p, "%+.4f", ep);
+            p += sprintf(p, " %s%s%s", pdim,
+                         ep > 0.05f ? "dissolving" : ep < -0.05f ? "ordering" : "stable", prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(34);
         }
         PROBE_ROW_END();
 
@@ -10757,6 +11108,12 @@ int main(int argc, char **argv) {
                 corr_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '=') {
+            eprod_mode = !eprod_mode;
+            if (eprod_mode) {
+                eprod_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -11267,6 +11624,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh spatial correlation every 4 generations */
         if (corr_mode && corr_stale && (generation % 4 == 0 || !running)) {
             corr_compute();
+        }
+
+        /* Auto-refresh entropy production rate every 2 generations (needs frequent updates) */
+        if (eprod_mode && eprod_stale && (generation % 2 == 0 || !running)) {
+            eprod_compute();
         }
 
         render(running, speed_ms, draw_mode);
