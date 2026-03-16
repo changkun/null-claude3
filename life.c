@@ -1056,7 +1056,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 38
+#define N_SPLIT_OVERLAYS 39
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1101,6 +1101,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "SymmGroup",    'G'-64 },  /* 35: Ctrl-G */
     { "TopoDefect",   'D'-64 },  /* 36: Ctrl-D */
     { "MeanField",    'F'-64 },  /* 37: Ctrl-F */
+    { "RuleInfer",    'R'-64 },  /* 38: Ctrl-R */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1638,6 +1639,98 @@ static void mf_reset(void) {
     memset(mf_hist_dev, 0, sizeof(mf_hist_dev));
 }
 
+/* ── Rule Inference Engine ─────────────────────────────────────────────────── */
+/* Watches the CA's dynamics and reconstructs birth/survival rules from
+   observation alone — the simulation performing science on itself.
+   For each cell, accumulates statistics: given neighborhood count k (0-8),
+   how often does a dead cell become alive (birth) or a live cell survive?
+   After enough samples, computes P(birth|k) and P(survive|k).
+   Compares inferred rules against actual ruleset to produce a fidelity map:
+   green = rule matches observation, red = deviation detected.
+   In multi-rule zone mode, naturally reveals zone boundaries.
+   Ghost code = 39.  Toggle with Ctrl-R key. */
+
+#define RI_HIST_LEN 64
+#define RI_MIN_SAMPLES 16   /* minimum samples before inferring rule */
+
+static int   ri_mode = 0;
+static int   ri_stale = 1;
+
+/* Per-cell fidelity: 0.0 = perfect match with actual rules, 1.0 = max deviation */
+static float ri_fidelity[MAX_H][MAX_W];
+
+/* Per-cell accumulated statistics: for each neighborhood count k (0-8),
+   count birth events (dead→alive) and survival events (alive→alive).
+   To save memory, store per-cell summary: inferred birth/survival masks + confidence */
+static unsigned short ri_inferred_birth[MAX_H][MAX_W];    /* inferred birth bitmask */
+static unsigned short ri_inferred_survival[MAX_H][MAX_W]; /* inferred survival bitmask */
+static unsigned char  ri_confidence[MAX_H][MAX_W];        /* 0-255 confidence level */
+
+/* Global histogram: count[alive_state][neighbor_count][outcome]
+   alive_state: 0=dead, 1=alive
+   neighbor_count: 0-8
+   outcome: 0=dies/stays_dead, 1=born/survives */
+static unsigned int ri_hist[2][9][2];  /* global transition histogram */
+
+/* Per-cell local histograms: use a compact rolling approach.
+   For each cell, track a small window of recent (k, was_alive, became_alive) triples.
+   To save memory: per-cell birth/survive counts per k, stored as a flat array. */
+#define RI_CELL_WINDOW 64  /* max samples per cell before decay */
+static unsigned short ri_cell_birth_yes[MAX_H][MAX_W][9];  /* birth events per k */
+static unsigned short ri_cell_birth_no[MAX_H][MAX_W][9];   /* no-birth events per k */
+static unsigned short ri_cell_surv_yes[MAX_H][MAX_W][9];   /* survival events per k */
+static unsigned short ri_cell_surv_no[MAX_H][MAX_W][9];    /* death events per k */
+
+/* Global inferred rule (from aggregated histogram) */
+static unsigned short ri_global_birth = 0;     /* inferred birth mask */
+static unsigned short ri_global_survival = 0;  /* inferred survival mask */
+static float ri_global_fidelity = 0.0f;        /* overall match fraction */
+static int   ri_total_samples = 0;             /* total observations */
+static float ri_birth_prob[9];                 /* P(birth|k) for k=0..8 */
+static float ri_surv_prob[9];                  /* P(survive|k) for k=0..8 */
+static float ri_birth_conf[9];                 /* confidence for each birth bit */
+static float ri_surv_conf[9];                  /* confidence for each survive bit */
+
+/* Sparkline history */
+static float ri_hist_fidelity[RI_HIST_LEN];
+static float ri_hist_samples[RI_HIST_LEN];
+static int   ri_hist_idx = 0;
+static int   ri_hist_count = 0;
+
+/* Previous grid state for transition tracking */
+static unsigned char ri_prev_grid[MAX_H][MAX_W];
+static unsigned char ri_prev_neighbors[MAX_H][MAX_W]; /* neighbor count at prev step */
+static int ri_has_prev = 0;  /* whether we have a previous state to compare */
+
+static void ri_compute(void);
+static void ri_reset(void) {
+    ri_stale = 1;
+    ri_global_birth = 0;
+    ri_global_survival = 0;
+    ri_global_fidelity = 0.0f;
+    ri_total_samples = 0;
+    ri_has_prev = 0;
+    ri_hist_idx = 0;
+    ri_hist_count = 0;
+    memset(ri_fidelity, 0, sizeof(ri_fidelity));
+    memset(ri_inferred_birth, 0, sizeof(ri_inferred_birth));
+    memset(ri_inferred_survival, 0, sizeof(ri_inferred_survival));
+    memset(ri_confidence, 0, sizeof(ri_confidence));
+    memset(ri_hist, 0, sizeof(ri_hist));
+    memset(ri_cell_birth_yes, 0, sizeof(ri_cell_birth_yes));
+    memset(ri_cell_birth_no, 0, sizeof(ri_cell_birth_no));
+    memset(ri_cell_surv_yes, 0, sizeof(ri_cell_surv_yes));
+    memset(ri_cell_surv_no, 0, sizeof(ri_cell_surv_no));
+    memset(ri_prev_grid, 0, sizeof(ri_prev_grid));
+    memset(ri_prev_neighbors, 0, sizeof(ri_prev_neighbors));
+    memset(ri_birth_prob, 0, sizeof(ri_birth_prob));
+    memset(ri_surv_prob, 0, sizeof(ri_surv_prob));
+    memset(ri_birth_conf, 0, sizeof(ri_birth_conf));
+    memset(ri_surv_conf, 0, sizeof(ri_surv_conf));
+    memset(ri_hist_fidelity, 0, sizeof(ri_hist_fidelity));
+    memset(ri_hist_samples, 0, sizeof(ri_hist_samples));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -1767,6 +1860,7 @@ static void split_set_overlay(int idx) {
     sg_mode = 0;
     td_mode = 0;
     mf_mode = 0;
+    ri_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1807,6 +1901,7 @@ static void split_set_overlay(int idx) {
         case 35: sg_mode = 1; break;
         case 36: td_mode = 1; break;
         case 37: mf_mode = 1; break;
+        case 38: ri_mode = 1; break;
     }
 }
 
@@ -1848,6 +1943,7 @@ static int split_detect_current(void) {
     if (sg_mode) return 35;
     if (td_mode) return 36;
     if (mf_mode) return 37;
+    if (ri_mode) return 38;
     return 0;
 }
 
@@ -3208,6 +3304,7 @@ static void grid_step(void) {
     sg_stale = 1;
     td_stale = 1;
     mf_stale = 1;
+    ri_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -8776,6 +8873,196 @@ static void mf_compute(void) {
     if (mf_hist_count < MF_HIST_LEN) mf_hist_count++;
 }
 
+/* ── Rule Inference Engine computation ─────────────────────────────────────── */
+static void ri_compute(void) {
+    ri_stale = 0;
+
+    /* Phase 1: Record transitions from previous state to current state.
+       For each cell, we know: was it alive? how many neighbors did it have?
+       And now: is it alive?  This gives us one observation per cell. */
+
+    if (ri_has_prev) {
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int was_alive = ri_prev_grid[y][x] > 0;
+                int is_alive = grid[y][x] > 0;
+                int k = ri_prev_neighbors[y][x];
+                if (k > 8) k = 8;
+
+                /* Update global histogram */
+                ri_hist[was_alive][k][is_alive ? 1 : 0]++;
+
+                /* Update per-cell histogram with decay */
+                if (was_alive) {
+                    /* Survival/death event */
+                    if (is_alive) {
+                        if (ri_cell_surv_yes[y][x][k] < 60000)
+                            ri_cell_surv_yes[y][x][k]++;
+                    } else {
+                        if (ri_cell_surv_no[y][x][k] < 60000)
+                            ri_cell_surv_no[y][x][k]++;
+                    }
+                } else {
+                    /* Birth/no-birth event */
+                    if (is_alive) {
+                        if (ri_cell_birth_yes[y][x][k] < 60000)
+                            ri_cell_birth_yes[y][x][k]++;
+                    } else {
+                        if (ri_cell_birth_no[y][x][k] < 60000)
+                            ri_cell_birth_no[y][x][k]++;
+                    }
+                }
+            }
+        }
+        ri_total_samples += H * W;
+    }
+
+    /* Phase 2: Snapshot current state as "previous" for next frame */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            ri_prev_grid[y][x] = grid[y][x];
+            /* Count neighbors */
+            int n = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int ny = y + dy, nx = x + dx;
+                    if (ny >= 0 && ny < H && nx >= 0 && nx < W) {
+                        if (grid[ny][nx] > 0) n++;
+                    }
+                }
+            }
+            ri_prev_neighbors[y][x] = (unsigned char)n;
+        }
+    }
+    ri_has_prev = 1;
+
+    /* Phase 3: Infer global birth/survival rules from histogram */
+    ri_global_birth = 0;
+    ri_global_survival = 0;
+    for (int k = 0; k <= 8; k++) {
+        /* Birth: P(born | dead, k neighbors) */
+        unsigned int b_total = ri_hist[0][k][0] + ri_hist[0][k][1];
+        if (b_total >= RI_MIN_SAMPLES) {
+            ri_birth_prob[k] = (float)ri_hist[0][k][1] / (float)b_total;
+            ri_birth_conf[k] = (b_total > 1000) ? 1.0f :
+                               (b_total > 100)  ? 0.8f :
+                               (b_total > 30)   ? 0.5f : 0.3f;
+            if (ri_birth_prob[k] > 0.5f)
+                ri_global_birth |= (1 << k);
+        } else {
+            ri_birth_prob[k] = 0.0f;
+            ri_birth_conf[k] = 0.0f;
+        }
+
+        /* Survival: P(survives | alive, k neighbors) */
+        unsigned int s_total = ri_hist[1][k][0] + ri_hist[1][k][1];
+        if (s_total >= RI_MIN_SAMPLES) {
+            ri_surv_prob[k] = (float)ri_hist[1][k][1] / (float)s_total;
+            ri_surv_conf[k] = (s_total > 1000) ? 1.0f :
+                              (s_total > 100)  ? 0.8f :
+                              (s_total > 30)   ? 0.5f : 0.3f;
+            if (ri_surv_prob[k] > 0.5f)
+                ri_global_survival |= (1 << k);
+        } else {
+            ri_surv_prob[k] = 0.0f;
+            ri_surv_conf[k] = 0.0f;
+        }
+    }
+
+    /* Phase 4: Per-cell fidelity map — compare local inferred rules to actual rules */
+    int fidelity_match = 0;
+    int fidelity_total = 0;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Determine actual rules for this cell */
+            unsigned short actual_birth = birth_mask;
+            unsigned short actual_surv = survival_mask;
+            if (zone_enabled && zone[y][x] < N_RULESETS) {
+                actual_birth = rulesets[zone[y][x]].birth;
+                actual_surv = rulesets[zone[y][x]].survival;
+            }
+
+            /* Infer local rules from per-cell histograms */
+            unsigned short local_birth = 0;
+            unsigned short local_surv = 0;
+            int total_local_samples = 0;
+            int local_matches = 0;
+            int local_bits_checked = 0;
+
+            for (int k = 0; k <= 8; k++) {
+                /* Local birth inference */
+                int bn = ri_cell_birth_yes[y][x][k] + ri_cell_birth_no[y][x][k];
+                if (bn >= RI_MIN_SAMPLES) {
+                    float p = (float)ri_cell_birth_yes[y][x][k] / (float)bn;
+                    if (p > 0.5f) local_birth |= (1 << k);
+                    /* Check against actual rule */
+                    int actual_bit = (actual_birth >> k) & 1;
+                    int inferred_bit = (p > 0.5f) ? 1 : 0;
+                    if (actual_bit == inferred_bit) local_matches++;
+                    local_bits_checked++;
+                }
+                total_local_samples += bn;
+
+                /* Local survival inference */
+                int sn = ri_cell_surv_yes[y][x][k] + ri_cell_surv_no[y][x][k];
+                if (sn >= RI_MIN_SAMPLES) {
+                    float p = (float)ri_cell_surv_yes[y][x][k] / (float)sn;
+                    if (p > 0.5f) local_surv |= (1 << k);
+                    int actual_bit = (actual_surv >> k) & 1;
+                    int inferred_bit = (p > 0.5f) ? 1 : 0;
+                    if (actual_bit == inferred_bit) local_matches++;
+                    local_bits_checked++;
+                }
+                total_local_samples += sn;
+            }
+
+            ri_inferred_birth[y][x] = local_birth;
+            ri_inferred_survival[y][x] = local_surv;
+
+            /* Fidelity: fraction of checked bits that match actual rules */
+            if (local_bits_checked > 0) {
+                float fid = (float)local_matches / (float)local_bits_checked;
+                ri_fidelity[y][x] = 1.0f - fid;  /* 0 = perfect match, 1 = total mismatch */
+                ri_confidence[y][x] = (unsigned char)(
+                    (total_local_samples > 500) ? 255 :
+                    (total_local_samples > 100) ? 200 :
+                    (total_local_samples > 30)  ? 128 : 64);
+                fidelity_match += local_matches;
+                fidelity_total += local_bits_checked;
+            } else {
+                ri_fidelity[y][x] = 0.0f;
+                ri_confidence[y][x] = 0;
+            }
+        }
+    }
+
+    /* Global fidelity score */
+    ri_global_fidelity = (fidelity_total > 0) ?
+        (float)fidelity_match / (float)fidelity_total : 0.0f;
+
+    /* Sparkline history */
+    ri_hist_fidelity[ri_hist_idx] = ri_global_fidelity;
+    ri_hist_samples[ri_hist_idx] = (ri_total_samples > 0) ?
+        (float)(ri_total_samples < 1000000 ? ri_total_samples : 1000000) / 1000000.0f : 0.0f;
+    ri_hist_idx = (ri_hist_idx + 1) % RI_HIST_LEN;
+    if (ri_hist_count < RI_HIST_LEN) ri_hist_count++;
+
+    /* Decay per-cell histograms periodically to adapt to rule changes */
+    if (ri_total_samples > 0 && (ri_total_samples % (H * W * 100)) < H * W) {
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                for (int k = 0; k <= 8; k++) {
+                    ri_cell_birth_yes[y][x][k] = ri_cell_birth_yes[y][x][k] * 3 / 4;
+                    ri_cell_birth_no[y][x][k]  = ri_cell_birth_no[y][x][k] * 3 / 4;
+                    ri_cell_surv_yes[y][x][k]  = ri_cell_surv_yes[y][x][k] * 3 / 4;
+                    ri_cell_surv_no[y][x][k]   = ri_cell_surv_no[y][x][k] * 3 / 4;
+                }
+            }
+        }
+    }
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -10070,6 +10357,7 @@ static void split_ensure_computed(int idx) {
         case 35: if (sg_stale) sg_compute(); break;
         case 36: if (td_stale) td_compute(); break;
         case 37: if (mf_stale) mf_compute(); break;
+        case 38: if (ri_stale) ri_compute(); break;
         default: break;
     }
 }
@@ -11978,6 +12266,52 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 38; /* 38 = mean field ghost */
+        }
+        return 0;
+    }
+
+    /* Rule Inference Engine overlay: fidelity map */
+    if (ri_mode) {
+        float dev = ri_fidelity[y][x];
+        int conf = ri_confidence[y][x];
+        if (grid[y][x] || dev > 0.01f || conf > 32) {
+            unsigned char r, g, b;
+            if (conf < 32) {
+                /* Insufficient data: dim gray */
+                r = 15; g = 15; b = 20;
+            } else if (dev < 0.05f) {
+                /* Perfect match: bright green (rules confirmed) */
+                float t = (float)conf / 255.0f;
+                r = (unsigned char)(5 + 10 * t);
+                g = (unsigned char)(30 + 170 * t);
+                b = (unsigned char)(15 + 40 * t);
+            } else if (dev < 0.2f) {
+                /* Slight deviation: green → yellow (minor noise / temperature effects) */
+                float t = (dev - 0.05f) / 0.15f;
+                r = (unsigned char)(15 + 180 * t);
+                g = (unsigned char)(200 - 20 * t);
+                b = (unsigned char)(55 - 30 * t);
+            } else if (dev < 0.5f) {
+                /* Moderate deviation: yellow → orange (zone boundary or mutation) */
+                float t = (dev - 0.2f) / 0.3f;
+                r = (unsigned char)(195 + 60 * t);
+                g = (unsigned char)(180 - 100 * t);
+                b = (unsigned char)(25 + 10 * t);
+            } else {
+                /* Strong deviation: orange → bright red (different rule region) */
+                float t = (dev - 0.5f) / 0.5f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(255);
+                g = (unsigned char)(80 - 60 * t);
+                b = (unsigned char)(35 + 60 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 39; /* 39 = rule inference ghost */
         }
         return 0;
     }
@@ -18149,6 +18483,251 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", mfrst);
     }
 
+    /* ── Rule Inference Engine overlay panel ────────────────────────────── */
+    if (ri_mode) {
+        int ri_pw = 50;
+        int ri_col = term_cols - ri_pw - 2;
+        int ri_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   ri_row += 8;
+        if (temp_mode)      ri_row += 9;
+        if (lyapunov_mode)  ri_row += 8;
+        if (fourier_mode)   ri_row += 18;
+        if (fractal_mode)   ri_row += 11;
+        if (wolfram_mode)   ri_row += 14;
+        if (flow_mode)      ri_row += 9;
+        if (attractor_mode) ri_row += 8;
+        if (cone_mode >= 1) ri_row += 8;
+        if (surp_mode)      ri_row += 8;
+        if (mi_mode)        ri_row += 12;
+        if (cplx_mode)      ri_row += 11;
+        if (topo_mode)      ri_row += 11;
+        if (rg_mode)        ri_row += 11;
+        if (kc_mode)        ri_row += 9;
+        if (corr_mode)      ri_row += 9;
+        if (eprod_mode)     ri_row += 9;
+        if (vort_mode)      ri_row += 9;
+        if (wave_mode)      ri_row += 9;
+        if (ergo_mode)      ri_row += 10;
+        if (coh_mode)       ri_row += 8;
+        if (ce_mode)        ri_row += 9;
+        if (ew_mode)        ri_row += 10;
+        if (hr_mode)        ri_row += 10;
+        if (rd_mode)        ri_row += 13;
+        if (xc_mode && xc_count >= 20) ri_row += 28;
+        if (fi_mode && fi_count >= 16)  ri_row += 12;
+        if (sg_mode)        ri_row += 12;
+        if (td_mode)        ri_row += 10;
+        if (mf_mode)        ri_row += 10;
+        if (ri_col < 1) ri_col = 1;
+
+        const char *ribdr = "\033[38;2;100;220;130;48;2;8;14;10m";  /* green border */
+        const char *ribg  = "\033[48;2;8;14;10m";
+        const char *rirst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xf0\x9f\x94\x8d Rule Inference ",
+                     ri_row, ri_col, ribdr);
+        for (int i = 22; i < ri_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rirst);
+
+        /* Row 1: Inferred rule string */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ri_row + 1, ri_col, ribdr, ribg);
+        {
+            char inferred_str[32];
+            char *sp = inferred_str;
+            *sp++ = 'B';
+            for (int k = 0; k <= 8; k++)
+                if (ri_global_birth & (1 << k)) *sp++ = '0' + k;
+            *sp++ = '/';
+            *sp++ = 'S';
+            for (int k = 0; k <= 8; k++)
+                if (ri_global_survival & (1 << k)) *sp++ = '0' + k;
+            *sp = '\0';
+
+            char actual_str[32];
+            rule_to_string(actual_str, sizeof(actual_str));
+
+            /* Color based on match */
+            const char *match_clr;
+            if (ri_global_birth == birth_mask && ri_global_survival == survival_mask)
+                match_clr = "\033[38;2;80;255;120m";  /* perfect match: bright green */
+            else
+                match_clr = "\033[38;2;255;200;60m";   /* mismatch: amber */
+
+            int n = sprintf(p, " %sInferred: %s", match_clr, inferred_str);
+            p += n;
+            int used = 22 + (int)strlen(inferred_str);
+            for (int i = used; i < ri_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ribdr, rirst);
+
+        /* Row 2: Actual rule + fidelity */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ri_row + 2, ri_col, ribdr, ribg);
+        {
+            char actual_str[32];
+            rule_to_string(actual_str, sizeof(actual_str));
+            const char *fid_clr;
+            if (ri_global_fidelity > 0.95f) fid_clr = "\033[38;2;80;255;120m";
+            else if (ri_global_fidelity > 0.8f) fid_clr = "\033[38;2;200;200;60m";
+            else if (ri_global_fidelity > 0.5f) fid_clr = "\033[38;2;255;160;40m";
+            else fid_clr = "\033[38;2;255;80;80m";
+            int n = sprintf(p, " \033[38;2;120;160;120mActual: %s  %sFid:%.1f%%",
+                            actual_str, fid_clr, ri_global_fidelity * 100.0f);
+            p += n;
+            int used = 35;
+            for (int i = used; i < ri_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ribdr, rirst);
+
+        /* Row 3: Birth probability bars */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ri_row + 3, ri_col, ribdr, ribg);
+        {
+            int n = sprintf(p, " \033[38;2;120;160;120mB:");
+            p += n;
+            for (int k = 0; k <= 8; k++) {
+                int actual_bit = (birth_mask >> k) & 1;
+                float prob = ri_birth_prob[k];
+                float conf = ri_birth_conf[k];
+                /* Color: green if matches actual, red if not, dim if low confidence */
+                int inferred_bit = (prob > 0.5f) ? 1 : 0;
+                unsigned char cr, cg, cb;
+                if (conf < 0.1f) {
+                    cr = 60; cg = 60; cb = 60;  /* no data: gray */
+                } else if (inferred_bit == actual_bit) {
+                    cr = (unsigned char)(30 + 200 * conf);
+                    cg = (unsigned char)(80 + 175 * conf);
+                    cb = (unsigned char)(30 + 50 * conf);
+                } else {
+                    cr = (unsigned char)(80 + 175 * conf);
+                    cg = (unsigned char)(30 + 50 * conf);
+                    cb = (unsigned char)(30 + 30 * conf);
+                }
+                /* Use block height to show probability */
+                const char *bar;
+                if (prob < 0.125f)      bar = "\xe2\x96\x81";
+                else if (prob < 0.25f)  bar = "\xe2\x96\x82";
+                else if (prob < 0.375f) bar = "\xe2\x96\x83";
+                else if (prob < 0.5f)   bar = "\xe2\x96\x84";
+                else if (prob < 0.625f) bar = "\xe2\x96\x85";
+                else if (prob < 0.75f)  bar = "\xe2\x96\x86";
+                else if (prob < 0.875f) bar = "\xe2\x96\x87";
+                else                    bar = "\xe2\x96\x88";
+                n = sprintf(p, "\033[38;2;%d;%d;%dm%s", cr, cg, cb, bar);
+                p += n;
+            }
+            /* Pad to fill */
+            int used = 38;
+            for (int i = used; i < ri_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ribdr, rirst);
+
+        /* Row 4: Survival probability bars */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ri_row + 4, ri_col, ribdr, ribg);
+        {
+            int n = sprintf(p, " \033[38;2;120;160;120mS:");
+            p += n;
+            for (int k = 0; k <= 8; k++) {
+                int actual_bit = (survival_mask >> k) & 1;
+                float prob = ri_surv_prob[k];
+                float conf = ri_surv_conf[k];
+                int inferred_bit = (prob > 0.5f) ? 1 : 0;
+                unsigned char cr, cg, cb;
+                if (conf < 0.1f) {
+                    cr = 60; cg = 60; cb = 60;
+                } else if (inferred_bit == actual_bit) {
+                    cr = (unsigned char)(30 + 200 * conf);
+                    cg = (unsigned char)(80 + 175 * conf);
+                    cb = (unsigned char)(30 + 50 * conf);
+                } else {
+                    cr = (unsigned char)(80 + 175 * conf);
+                    cg = (unsigned char)(30 + 50 * conf);
+                    cb = (unsigned char)(30 + 30 * conf);
+                }
+                const char *bar;
+                if (prob < 0.125f)      bar = "\xe2\x96\x81";
+                else if (prob < 0.25f)  bar = "\xe2\x96\x82";
+                else if (prob < 0.375f) bar = "\xe2\x96\x83";
+                else if (prob < 0.5f)   bar = "\xe2\x96\x84";
+                else if (prob < 0.625f) bar = "\xe2\x96\x85";
+                else if (prob < 0.75f)  bar = "\xe2\x96\x86";
+                else if (prob < 0.875f) bar = "\xe2\x96\x87";
+                else                    bar = "\xe2\x96\x88";
+                n = sprintf(p, "\033[38;2;%d;%d;%dm%s", cr, cg, cb, bar);
+                p += n;
+            }
+            int used = 38;
+            for (int i = used; i < ri_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ribdr, rirst);
+
+        /* Row 5: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ri_row + 5, ri_col, ribdr, ribg);
+        p += sprintf(p, " \033[38;2;50;80;50m");
+        for (int i = 1; i < ri_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ribdr, rirst);
+
+        /* Row 6: Samples + legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ri_row + 6, ri_col, ribdr, ribg);
+        {
+            int n = sprintf(p, " \033[38;2;100;180;100mN:%dk"
+                               " \033[38;2;80;200;100m\xe2\x96\x88\033[38;2;100;140;100mmatch"
+                               " \033[38;2;200;80;60m\xe2\x96\x88\033[38;2;100;140;100mdeviate"
+                               " \033[38;2;100;140;100m[^R]",
+                            ri_total_samples / 1000);
+            p += n;
+            int used = 42;
+            for (int i = used; i < ri_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ribdr, rirst);
+
+        /* Rows 7-8: Sparklines — fidelity and sample count */
+        for (int sp = 0; sp < 2; sp++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         ri_row + 7 + sp, ri_col, ribdr, ribg);
+            const char *spark_blocks[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                          "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                          "\xe2\x96\x87","\xe2\x96\x88"};
+            float *hist = (sp == 0) ? ri_hist_fidelity : ri_hist_samples;
+            const char *label = (sp == 0) ? "Fid" : "Smp";
+            const char *clr = (sp == 0) ? "\033[38;2;80;220;120m" : "\033[38;2;120;160;200m";
+            int n = sprintf(p, " \033[38;2;80;100;70m%-3s%s", label, clr);
+            p += n;
+            int spark_w = ri_pw - 7;
+            for (int i = 0; i < spark_w && i < RI_HIST_LEN; i++) {
+                int idx = (ri_hist_idx - ri_hist_count + i + RI_HIST_LEN) % RI_HIST_LEN;
+                if (i >= ri_hist_count) {
+                    *p++ = ' ';
+                } else {
+                    float v = hist[idx];
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    int bi = (int)(v * 7.0f);
+                    if (bi > 7) bi = 7;
+                    const char *blk = spark_blocks[bi];
+                    while (*blk) *p++ = *blk++;
+                }
+            }
+            int used = spark_w + 5;
+            for (int i = used; i < ri_pw - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", ribdr, rirst);
+        }
+
+        /* Bottom border */
+        int ri_bottom = ri_row + 9;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", ri_bottom, ri_col, ribdr);
+        for (int i = 0; i < ri_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rirst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -21490,6 +22069,19 @@ int main(int argc, char **argv) {
                     printf("\033[2J"); fflush(stdout);
                 } else {
                     flash_set("Mean Field off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
+        else if (key == 18) { /* Ctrl-R: Rule Inference Engine */
+            if (!ecosystem_mode) {
+                ri_mode = !ri_mode;
+                if (ri_mode) {
+                    ri_reset();
+                    flash_set("Rule Inference: reconstructing B/S rules from observation [^R]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Rule Inference off");
                     printf("\033[2J"); fflush(stdout);
                 }
             }
