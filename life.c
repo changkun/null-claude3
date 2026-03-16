@@ -131,6 +131,9 @@
  *   Ctrl-D      Toggle topological defect tracker (vortex/wall/charge detection)
  *                 Computes winding numbers on density-gradient orientation field
  *                 Pink=+1 vortex, cyan=-1 vortex, yellow=domain wall
+ *   Ctrl-F      Toggle mean field deviation (where correlations beat density)
+ *                 Compares actual CA dynamics to mean-field theory predictions
+ *                 Teal=MF accurate, amber=deviating, orange=correlated
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -1053,7 +1056,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 37
+#define N_SPLIT_OVERLAYS 38
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1097,6 +1100,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "CrossCorr",    '2'  },  /* 34 */
     { "SymmGroup",    'G'-64 },  /* 35: Ctrl-G */
     { "TopoDefect",   'D'-64 },  /* 36: Ctrl-D */
+    { "MeanField",    'F'-64 },  /* 37: Ctrl-F */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1578,6 +1582,62 @@ static void td_reset(void) {
     memset(td_hist_total, 0, sizeof(td_hist_total));
 }
 
+/* ── Mean Field Deviation ──────────────────────────────────────────────────── */
+/* Compares actual CA dynamics to mean-field theory predictions.  For each cell,
+   computes the probability that the cell's next state matches mean-field theory
+   (which assumes neighbors are uncorrelated, using only local density).
+   Where mean-field fails: spatial correlations and structure drive dynamics.
+   Where mean-field succeeds: behavior is density-determined, random-like.
+   This identifies exactly where the CA is "interesting" — where geometry matters.
+   Panel shows global accuracy, correlation fraction, spatial distribution.
+   Ghost code = 38.  Toggle with Ctrl-F key. */
+
+#define MF_HIST_LEN 64
+#define MF_TRACK_LEN 32    /* frames to accumulate prediction accuracy */
+
+static int   mf_mode = 0;
+static int   mf_stale = 1;
+
+/* Per-cell deviation: 0.0 = perfect mean-field match, 1.0 = max deviation */
+static float mf_dev[MAX_H][MAX_W];
+
+/* Per-cell tracking: ring buffer of actual outcomes vs MF predictions */
+static unsigned char mf_hits[MAX_H][MAX_W];    /* hit count (MF correct) in window */
+static unsigned char mf_samples[MAX_H][MAX_W]; /* total samples in window */
+
+/* Global aggregates */
+static float mf_global_accuracy = 0.0f;  /* fraction of cells where MF is correct */
+static float mf_mean_dev = 0.0f;         /* mean deviation across grid */
+static float mf_corr_frac = 0.0f;        /* fraction of cells where correlations dominate */
+static float mf_struct_score = 0.0f;     /* spatial clustering of deviations */
+static int   mf_frame_count = 0;         /* frames accumulated so far */
+
+/* Sparkline history */
+static float mf_hist_acc[MF_HIST_LEN];   /* accuracy history */
+static float mf_hist_dev[MF_HIST_LEN];   /* mean deviation history */
+static int   mf_hist_idx = 0;
+static int   mf_hist_count = 0;
+
+/* Precomputed binomial coefficients C(8,k) */
+static const int mf_binom8[9] = {1, 8, 28, 56, 70, 56, 28, 8, 1};
+
+static void mf_compute(void);
+static void mf_reset(void) {
+    mf_stale = 1;
+    mf_global_accuracy = 0.0f;
+    mf_mean_dev = 0.0f;
+    mf_corr_frac = 0.0f;
+    mf_struct_score = 0.0f;
+    mf_frame_count = 0;
+    mf_hist_idx = 0;
+    mf_hist_count = 0;
+    memset(mf_dev, 0, sizeof(mf_dev));
+    memset(mf_hits, 0, sizeof(mf_hits));
+    memset(mf_samples, 0, sizeof(mf_samples));
+    memset(mf_hist_acc, 0, sizeof(mf_hist_acc));
+    memset(mf_hist_dev, 0, sizeof(mf_hist_dev));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -1706,6 +1766,7 @@ static void split_set_overlay(int idx) {
     fi_mode = 0;
     sg_mode = 0;
     td_mode = 0;
+    mf_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1745,6 +1806,7 @@ static void split_set_overlay(int idx) {
         case 34: xc_mode = 1; break;
         case 35: sg_mode = 1; break;
         case 36: td_mode = 1; break;
+        case 37: mf_mode = 1; break;
     }
 }
 
@@ -1785,6 +1847,7 @@ static int split_detect_current(void) {
     if (xc_mode) return 34;
     if (sg_mode) return 35;
     if (td_mode) return 36;
+    if (mf_mode) return 37;
     return 0;
 }
 
@@ -3144,6 +3207,7 @@ static void grid_step(void) {
     fi_stale = 1;
     sg_stale = 1;
     td_stale = 1;
+    mf_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -8585,6 +8649,133 @@ static void td_compute(void) {
     if (td_hist_count < TD_HIST_LEN) td_hist_count++;
 }
 
+/* ── Mean Field Deviation computation ──────────────────────────────────────── */
+static void mf_compute(void) {
+    mf_stale = 0;
+    mf_frame_count++;
+
+    /* For each cell, compute mean-field prediction and compare to actual outcome.
+       Mean-field approximation: assume neighbors are i.i.d. Bernoulli(ρ) where
+       ρ is the local density.  Then P(k neighbors alive) = C(8,k) ρ^k (1-ρ)^(8-k).
+       The MF prediction for birth/survival is:
+         P(alive next) = Σ_{k in B/S mask} C(8,k) ρ^k (1-ρ)^(8-k)
+       Compare to actual outcome (0 or 1). */
+
+    unsigned short b_mask = birth_mask;
+    unsigned short s_mask = survival_mask;
+    float total_dev = 0.0f;
+    int total_correct = 0;
+    int total_corr_cells = 0;
+    int cell_count = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Compute local density ρ from Moore neighborhood */
+            int alive_neighbors = 0;
+            int neighbor_count = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int ny = y + dy, nx = x + dx;
+                    if (ny >= 0 && ny < H && nx >= 0 && nx < W) {
+                        if (grid[ny][nx] > 0) alive_neighbors++;
+                        neighbor_count++;
+                    }
+                }
+            }
+
+            /* Use zone-specific rules if zones are active */
+            unsigned short bm = b_mask, sm = s_mask;
+            if (zone_enabled && zone[y][x] < N_RULESETS) {
+                bm = rulesets[zone[y][x]].birth;
+                sm = rulesets[zone[y][x]].survival;
+            }
+
+            /* Density from actual neighbor count (handle edge cells) */
+            float rho = (neighbor_count > 0) ? (float)alive_neighbors / (float)neighbor_count : 0.0f;
+
+            /* Compute mean-field probability P(alive next step) */
+            float p_alive = 0.0f;
+            int is_alive = grid[y][x] > 0;
+            unsigned short mask = is_alive ? sm : bm;
+
+            /* For edge cells with fewer than 8 neighbors, use adjusted binomial.
+               For simplicity, use full 8-neighbor binomial — close enough for
+               interior cells which dominate the grid. */
+            for (int k = 0; k <= 8; k++) {
+                if (mask & (1 << k)) {
+                    /* C(8,k) * rho^k * (1-rho)^(8-k) */
+                    float prob = (float)mf_binom8[k];
+                    float rk = 1.0f, rmk = 1.0f;
+                    for (int i = 0; i < k; i++) rk *= rho;
+                    for (int i = 0; i < 8 - k; i++) rmk *= (1.0f - rho);
+                    prob *= rk * rmk;
+                    p_alive += prob;
+                }
+            }
+
+            /* Clamp to [0.001, 0.999] to avoid degenerate cases */
+            if (p_alive < 0.001f) p_alive = 0.001f;
+            if (p_alive > 0.999f) p_alive = 0.999f;
+
+            /* Actual outcome: is this cell alive in current grid?
+               We compare MF prediction against actual state. */
+            float actual = is_alive ? 1.0f : 0.0f;
+            int mf_correct = ((p_alive >= 0.5f) == (actual >= 0.5f)) ? 1 : 0;
+
+            /* Update rolling accuracy tracker */
+            if (mf_samples[y][x] < MF_TRACK_LEN) {
+                mf_samples[y][x]++;
+                mf_hits[y][x] += mf_correct;
+            } else {
+                /* Exponential decay: reduce old contributions */
+                mf_hits[y][x] = (unsigned char)(mf_hits[y][x] * 7 / 8 + mf_correct);
+                /* Keep samples at window size */
+                mf_samples[y][x] = (unsigned char)(mf_samples[y][x] * 7 / 8 + 1);
+            }
+
+            /* Compute deviation: |actual - MF prediction| */
+            float dev = fabsf(actual - p_alive);
+            mf_dev[y][x] = dev;
+
+            total_dev += dev;
+            total_correct += mf_correct;
+            if (dev > 0.3f) total_corr_cells++;
+            cell_count++;
+        }
+    }
+
+    /* Update global aggregates */
+    if (cell_count > 0) {
+        mf_global_accuracy = (float)total_correct / (float)cell_count;
+        mf_mean_dev = total_dev / (float)cell_count;
+        mf_corr_frac = (float)total_corr_cells / (float)cell_count;
+    }
+
+    /* Compute structural score: how spatially clustered are the deviations?
+       Simple measure: average deviation of neighboring cells' deviation values.
+       High = deviations are spatially correlated (structured), low = random. */
+    float struct_sum = 0.0f;
+    int struct_n = 0;
+    for (int y = 1; y < H - 1; y += 2) {
+        for (int x = 1; x < W - 1; x += 2) {
+            float center = mf_dev[y][x];
+            float neighbor_mean = (mf_dev[y-1][x] + mf_dev[y+1][x] +
+                                   mf_dev[y][x-1] + mf_dev[y][x+1]) * 0.25f;
+            float coherence = 1.0f - fabsf(center - neighbor_mean);
+            struct_sum += coherence * center; /* weight by deviation magnitude */
+            struct_n++;
+        }
+    }
+    mf_struct_score = (struct_n > 0) ? struct_sum / struct_n : 0.0f;
+
+    /* Sparkline history */
+    mf_hist_acc[mf_hist_idx] = mf_global_accuracy;
+    mf_hist_dev[mf_hist_idx] = mf_mean_dev;
+    mf_hist_idx = (mf_hist_idx + 1) % MF_HIST_LEN;
+    if (mf_hist_count < MF_HIST_LEN) mf_hist_count++;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -9878,6 +10069,7 @@ static void split_ensure_computed(int idx) {
         case 34: if (xc_stale && xc_count >= 20) xc_compute(); break;
         case 35: if (sg_stale) sg_compute(); break;
         case 36: if (td_stale) td_compute(); break;
+        case 37: if (mf_stale) mf_compute(); break;
         default: break;
     }
 }
@@ -11744,6 +11936,48 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 37; /* 37 = defect ghost */
+        }
+        return 0;
+    }
+
+    /* Mean Field Deviation overlay: where correlations matter */
+    if (mf_mode) {
+        float dev = mf_dev[y][x];
+        if (grid[y][x] || dev > 0.02f) {
+            unsigned char r, g, b;
+            if (dev < 0.1f) {
+                /* MF accurate: deep teal-black (density-determined, boring) */
+                float t = dev / 0.1f;
+                r = (unsigned char)(5 + 10 * t);
+                g = (unsigned char)(15 + 30 * t);
+                b = (unsigned char)(20 + 25 * t);
+            } else if (dev < 0.3f) {
+                /* Moderate deviation: teal to amber (correlations emerging) */
+                float t = (dev - 0.1f) / 0.2f;
+                r = (unsigned char)(15 + 160 * t);
+                g = (unsigned char)(45 + 80 * t);
+                b = (unsigned char)(45 - 30 * t);
+            } else if (dev < 0.6f) {
+                /* Strong deviation: amber to hot orange (correlations dominate) */
+                float t = (dev - 0.3f) / 0.3f;
+                r = (unsigned char)(175 + 80 * t);
+                g = (unsigned char)(125 - 30 * t);
+                b = (unsigned char)(15 + 20 * t);
+            } else {
+                /* Extreme deviation: bright white-gold (pure structure) */
+                float t = (dev - 0.6f) / 0.4f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(255);
+                g = (unsigned char)(95 + 160 * t);
+                b = (unsigned char)(35 + 180 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 38; /* 38 = mean field ghost */
         }
         return 0;
     }
@@ -17750,6 +17984,171 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", tdrst);
     }
 
+    /* ── Mean Field Deviation overlay panel ────────────────────────────── */
+    if (mf_mode) {
+        int mf_pw = 50;
+        int mf_col = term_cols - mf_pw - 2;
+        int mf_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   mf_row += 8;
+        if (temp_mode)      mf_row += 9;
+        if (lyapunov_mode)  mf_row += 8;
+        if (fourier_mode)   mf_row += 18;
+        if (fractal_mode)   mf_row += 11;
+        if (wolfram_mode)   mf_row += 14;
+        if (flow_mode)      mf_row += 9;
+        if (attractor_mode) mf_row += 8;
+        if (cone_mode >= 1) mf_row += 8;
+        if (surp_mode)      mf_row += 8;
+        if (mi_mode)        mf_row += 12;
+        if (cplx_mode)      mf_row += 11;
+        if (topo_mode)      mf_row += 11;
+        if (rg_mode)        mf_row += 11;
+        if (kc_mode)        mf_row += 9;
+        if (corr_mode)      mf_row += 9;
+        if (eprod_mode)     mf_row += 9;
+        if (vort_mode)      mf_row += 9;
+        if (wave_mode)      mf_row += 9;
+        if (ergo_mode)      mf_row += 10;
+        if (coh_mode)       mf_row += 8;
+        if (ce_mode)        mf_row += 9;
+        if (ew_mode)        mf_row += 10;
+        if (hr_mode)        mf_row += 10;
+        if (rd_mode)        mf_row += 13;
+        if (xc_mode && xc_count >= 20) mf_row += 28;
+        if (fi_mode && fi_count >= 16)  mf_row += 12;
+        if (sg_mode)        mf_row += 12;
+        if (td_mode)        mf_row += 10;
+        if (mf_col < 1) mf_col = 1;
+
+        const char *mfbdr = "\033[38;2;200;150;50;48;2;14;10;8m";  /* amber border */
+        const char *mfbg  = "\033[48;2;14;10;8m";
+        const char *mfrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x9a\x96 Mean Field ",
+                     mf_row, mf_col, mfbdr);
+        for (int i = 17; i < mf_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", mfrst);
+
+        /* Row 1: MF Accuracy + Mean Deviation */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mf_row + 1, mf_col, mfbdr, mfbg);
+        {
+            const char *acc_clr;
+            if (mf_global_accuracy > 0.7f) acc_clr = "\033[38;2;80;200;120m";
+            else if (mf_global_accuracy > 0.4f) acc_clr = "\033[38;2;200;180;60m";
+            else acc_clr = "\033[38;2;255;100;60m";
+            int n = sprintf(p, " \033[38;2;160;140;100mAccuracy:%s%.1f%%"
+                               "  \033[38;2;160;140;100m\xce\x94:%.3f",
+                            acc_clr, mf_global_accuracy * 100.0f,
+                            mf_mean_dev);
+            p += n;
+            int used = 30;
+            for (int i = used; i < mf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 2: Correlation fraction + structure score */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mf_row + 2, mf_col, mfbdr, mfbg);
+        {
+            const char *corr_clr;
+            if (mf_corr_frac > 0.5f) corr_clr = "\033[38;2;255;120;40m";
+            else if (mf_corr_frac > 0.2f) corr_clr = "\033[38;2;200;160;60m";
+            else corr_clr = "\033[38;2;80;180;160m";
+            int n = sprintf(p, " \033[38;2;160;140;100mCorr:%s%.1f%%"
+                               "  \033[38;2;160;140;100mStruct:%.3f",
+                            corr_clr, mf_corr_frac * 100.0f,
+                            mf_struct_score);
+            p += n;
+            int used = 32;
+            for (int i = used; i < mf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 3: Interpretation line */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mf_row + 3, mf_col, mfbdr, mfbg);
+        {
+            const char *interp;
+            if (mf_global_accuracy > 0.75f)
+                interp = "\033[38;2;80;180;140mMF regime: density-driven";
+            else if (mf_global_accuracy > 0.5f)
+                interp = "\033[38;2;200;180;60mMixed: partial correlations";
+            else if (mf_global_accuracy > 0.3f)
+                interp = "\033[38;2;255;140;50mCorrelated: structure matters";
+            else
+                interp = "\033[38;2;255;80;80mNon-MF: geometry dominates";
+            int n = sprintf(p, " %s", interp);
+            p += n;
+            int used = 32;
+            for (int i = used; i < mf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mf_row + 4, mf_col, mfbdr, mfbg);
+        p += sprintf(p, " \033[38;2;80;60;40m");
+        for (int i = 1; i < mf_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 5: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mf_row + 5, mf_col, mfbdr, mfbg);
+        {
+            int n = sprintf(p, " \033[38;2;20;40;45m\xe2\x96\x88\033[38;2;120;100;80mMF ok"
+                               " \033[38;2;175;125;15m\xe2\x96\x88\033[38;2;120;100;80mdeviate"
+                               " \033[38;2;255;95;35m\xe2\x96\x88\033[38;2;120;100;80mcorrel"
+                               " \033[38;2;120;100;80m[^F]");
+            p += n;
+            int used = 38;
+            for (int i = used; i < mf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 6-7: Sparklines — accuracy and deviation */
+        for (int sp = 0; sp < 2; sp++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         mf_row + 6 + sp, mf_col, mfbdr, mfbg);
+            const char *spark_blocks[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                          "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                          "\xe2\x96\x87","\xe2\x96\x88"};
+            float *hist = (sp == 0) ? mf_hist_acc : mf_hist_dev;
+            const char *label = (sp == 0) ? "Acc" : "Dev";
+            const char *clr = (sp == 0) ? "\033[38;2;80;200;120m" : "\033[38;2;255;140;50m";
+            int n = sprintf(p, " \033[38;2;100;80;60m%-3s%s", label, clr);
+            p += n;
+            int spark_w = mf_pw - 7;
+            for (int i = 0; i < spark_w && i < MF_HIST_LEN; i++) {
+                int idx = (mf_hist_idx - mf_hist_count + i + MF_HIST_LEN) % MF_HIST_LEN;
+                if (i >= mf_hist_count) {
+                    *p++ = ' ';
+                } else {
+                    float v = hist[idx];
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    int bi = (int)(v * 7.0f);
+                    if (bi > 7) bi = 7;
+                    const char *blk = spark_blocks[bi];
+                    while (*blk) *p++ = *blk++;
+                }
+            }
+            int used = spark_w + 5;
+            for (int i = used; i < mf_pw - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+        }
+
+        /* Bottom border */
+        int mf_bottom = mf_row + 8;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", mf_bottom, mf_col, mfbdr);
+        for (int i = 0; i < mf_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", mfrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -21082,6 +21481,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == 6) { /* Ctrl-F: Mean Field Deviation */
+            if (!ecosystem_mode) {
+                mf_mode = !mf_mode;
+                if (mf_mode) {
+                    mf_reset();
+                    flash_set("Mean Field: where correlations beat density [^F]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Mean Field off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -21817,6 +22229,13 @@ int main(int argc, char **argv) {
         if (sg_mode && running && (generation % 4 == 0)) {
             if (sg_stale) {
                 sg_compute();
+            }
+        }
+
+        /* Mean Field Deviation: recompute every 2 generations */
+        if (mf_mode && running && (generation % 2 == 0)) {
+            if (mf_stale) {
+                mf_compute();
             }
         }
 

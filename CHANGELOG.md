@@ -1,8 +1,34 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~21,800 lines
-(Round 70).
+features. The project grew from ~790 lines (Round 1) to ~22,250 lines
+(Round 71).
+
+## Round 71 — Mean Field Deviation Overlay
+
+Opens a new analytical domain: **statistical mechanics mean-field theory
+as a diagnostic lens**. Press `Ctrl-F` to compare actual CA dynamics to
+mean-field theory predictions. For each cell, computes the probability of
+birth or survival assuming uncorrelated neighbors using the exact binomial
+distribution: P(k) = C(8,k) * ρ^k * (1-ρ)^(8-k), where ρ is local
+density, then sums over the active B/S rule mask. Compares this
+MF-predicted probability to the actual CA outcome — deviation measures
+where spatial correlations and geometry override simple density statistics.
+Supports zone-specific rules (per-cell ruleset zones). Tracks rolling
+accuracy with an exponential-decay window per cell. Computes a structural
+score measuring spatial clustering of high-deviation cells — reveals
+whether correlation-dominated regions are organized structures or scattered
+noise. Color scheme: deep teal (MF accurate, behavior is density-determined)
+→ amber (deviating) → hot orange (correlations dominate) → white-gold (pure
+structural dynamics). Sidebar panel shows global accuracy %, mean deviation,
+correlation fraction, structure score, interpretive classification (MF
+regime / mixed / correlated / non-MF), color legend, and dual sparklines
+(accuracy and deviation history). Ghost layer #38. Answers the fundamental
+question of statistical mechanics: when can you ignore correlations?
+Gliders, oscillators, and structured patterns glow hot (MF fails); random
+soups and uniform regions stay dark (MF succeeds). Connects to Ising model
+mean-field theory, Landau theory, and the renormalization group program.
+38th analysis overlay. +420 lines.
 
 ## Round 70 — Topological Defect Tracker Overlay
 
