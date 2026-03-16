@@ -75,6 +75,9 @@
  *   =           Toggle entropy production rate (thermodynamic arrow of time)
  *                 Local dS/dt: where order emerges vs dissolves
  *                 Blue=ordering, gray=equilibrium, red=disordering
+ *   ~           Toggle wave mechanics overlay (interference from births/deaths)
+ *                 Births emit positive impulses, deaths negative — 2D wave equation
+ *                 Cyan=positive amplitude, dark=zero, orange=negative
  *   D           Auto-demo mode — curated tour of pattern + overlay combos
  *                 Cycles through 10 scenes; press any key to exit and explore
  *   ?           Toggle cell probe inspector (click any cell for all metrics)
@@ -94,6 +97,8 @@
  *         ./life pattern.rle  (load RLE file)
  */
 
+#define _XOPEN_SOURCE 500
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +109,10 @@
 #include <signal.h>
 #include <time.h>
 #include <math.h>
+
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
 
 /* ── Grid ──────────────────────────────────────────────────────────────────── */
 
@@ -530,6 +539,39 @@ static float eprod_frac_neg = 0.0f;        /* fraction of cells with negative dS
 static float eprod_hist[EPROD_HIST_LEN];
 static int   eprod_hist_idx = 0;
 static int   eprod_hist_count = 0;
+
+/* ── Wave Mechanics Overlay ──────────────────────────────────────────────── */
+/* Continuous wave physics on the discrete automaton: cell births emit positive
+   impulses, deaths emit negative impulses.  These propagate via a damped 2D
+   wave equation (Laplacian + damping), creating interference patterns that
+   reveal information propagation speed, standing waves near oscillators, and
+   constructive/destructive interference at activity boundaries.
+   Color: cyan (positive amplitude) → dark (zero) → orange (negative). */
+#define WAVE_DAMPING   0.96f   /* amplitude decay per step (< 1 for dissipation) */
+#define WAVE_SPEED     0.25f   /* wave propagation speed (c²) — 0.25 is stable for 2D */
+#define WAVE_IMPULSE   0.5f    /* amplitude of birth/death impulses */
+#define WAVE_HIST_LEN  64      /* sparkline history length */
+
+static float wave_u[MAX_H][MAX_W];      /* current amplitude field */
+static float wave_v[MAX_H][MAX_W];      /* velocity field (du/dt) */
+static int   wave_mode = 0;             /* 0=off, 1=on */
+static int   wave_stale = 1;            /* 1=needs recomputation */
+static float wave_energy = 0.0f;        /* total wave energy (kinetic + potential) */
+static float wave_max_amp = 0.0f;       /* max absolute amplitude */
+static float wave_mean_amp = 0.0f;      /* mean absolute amplitude */
+static float wave_dom_wl = 0.0f;        /* estimated dominant wavelength */
+static float wave_speed_est = 0.0f;     /* estimated propagation speed */
+static int   wave_n_sources = 0;        /* active impulse sources this frame */
+
+/* Previous grid state for detecting births/deaths */
+static unsigned char wave_prev[MAX_H][MAX_W];
+static int   wave_has_prev = 0;         /* 0=no previous grid snapshot */
+
+/* Sparkline history */
+static float wave_hist_energy[WAVE_HIST_LEN];
+static float wave_hist_amp[WAVE_HIST_LEN];
+static int   wave_hist_idx = 0;
+static int   wave_hist_count = 0;
 
 /* ── Cell Probe Inspector ─────────────────────────────────────────────────── */
 /* Click-to-inspect tool: shows all analysis metrics for a single cell.
@@ -1457,6 +1499,7 @@ static void grid_step(void) {
     kc_stale = 1;
     corr_stale = 1;
     eprod_stale = 1;
+    wave_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -1566,7 +1609,7 @@ static void census_scan(void) {
 }
 
 /* ── Spaceship detection: compare consecutive timeline frames ─────────────── */
-static int ship_match_at(const unsigned char frame[MAX_H][MAX_W],
+static int ship_match_at(unsigned char frame[MAX_H][MAX_W],
                          const ShipPhase *ph, int x, int y) {
     /* Check pattern interior: exact alive/dead match */
     for (int py = 0; py < ph->h; py++) {
@@ -2119,6 +2162,7 @@ static void rg_compute(void);
 static void kc_compute(void);
 static void corr_compute(void);
 static void eprod_compute(void);
+static void wave_compute(void);
 
 static void demo_reset_overlays(void) {
     freq_mode = 0;
@@ -2134,6 +2178,7 @@ static void demo_reset_overlays(void) {
     kc_mode = 0;
     corr_mode = 0;
     eprod_mode = 0;
+    wave_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -2192,6 +2237,7 @@ static void demo_setup_scene(int idx) {
             case '^': kc_mode = 1; kc_compute(); break;
             case '&': corr_mode = 1; corr_compute(); break;
             case '=': eprod_mode = 1; eprod_compute(); break;
+            case '~': wave_mode = 1; wave_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -3896,8 +3942,10 @@ static void attractor_compute(void) {
     for (int i = 0; i < traj_len; i++) {
         int bx = (int)(attr_pts_x[i] * (ATTR_BINS - 1));
         int by = (int)((1.0f - attr_pts_y[i]) * (ATTR_BINS - 1)); /* invert Y for screen */
-        if (bx < 0) bx = 0; if (bx >= ATTR_BINS) bx = ATTR_BINS - 1;
-        if (by < 0) by = 0; if (by >= ATTR_BINS) by = ATTR_BINS - 1;
+        if (bx < 0) bx = 0;
+        if (bx >= ATTR_BINS) bx = ATTR_BINS - 1;
+        if (by < 0) by = 0;
+        if (by >= ATTR_BINS) by = ATTR_BINS - 1;
         attr_canvas[by][bx]++;
         if (attr_canvas[by][bx] > attr_canvas_max)
             attr_canvas_max = attr_canvas[by][bx];
@@ -4024,7 +4072,6 @@ static void cone_compute(void) {
 
     for (int dy = -fwd; dy <= fwd; dy++) {
         for (int dx = -fwd; dx <= fwd; dx++) {
-            int dist = (dy < 0 ? -dy : dy) + (dx < 0 ? -dx : dx);
             /* Chebyshev distance for Moore neighborhood: max(|dx|,|dy|) */
             int cheb = (dy < 0 ? -dy : dy);
             if ((dx < 0 ? -dx : dx) > cheb) cheb = (dx < 0 ? -dx : dx);
@@ -4059,7 +4106,7 @@ static void surp_record_frame(void) {
 }
 
 /* Compute neighborhood configuration hash for cell (x,y) in a grid snapshot */
-static unsigned int surp_nbr_hash(const unsigned char g[MAX_H][MAX_W], int x, int y) {
+static unsigned int surp_nbr_hash(unsigned char g[MAX_H][MAX_W], int x, int y) {
     unsigned int h = 0;
     int bit = 0;
     for (int dy = -1; dy <= 1; dy++) {
@@ -5156,6 +5203,174 @@ static RGB eprod_to_rgb(float ds) {
     }
 }
 
+/* ── Wave Mechanics computation ───────────────────────────────────────────── */
+/* Damped 2D wave equation: d²u/dt² = c²∇²u - γ du/dt + S(x,y,t)
+   where S = impulses from cell births (+) and deaths (-).
+   Discretized via Verlet-like velocity update:
+     v(t+1) = damping * (v(t) + c² * Laplacian(u))  + impulse
+     u(t+1) = u(t) + v(t+1)                                      */
+static void wave_compute(void) {
+    int sources = 0;
+
+    /* Detect births/deaths as impulse sources */
+    if (wave_has_prev) {
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int was = wave_prev[y][x] > 0 ? 1 : 0;
+                int now = grid[y][x] > 0 ? 1 : 0;
+                if (now && !was) {
+                    /* Birth: positive impulse */
+                    wave_v[y][x] += WAVE_IMPULSE;
+                    sources++;
+                } else if (!now && was) {
+                    /* Death: negative impulse */
+                    wave_v[y][x] -= WAVE_IMPULSE;
+                    sources++;
+                }
+            }
+        }
+    }
+
+    /* Propagate wave equation: velocity += c² * Laplacian(u) */
+    /* Use temporary storage for new amplitude to avoid read-write conflicts */
+    static float wave_u_new[MAX_H][MAX_W];
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* 5-point Laplacian stencil */
+            float center = wave_u[y][x];
+            float up    = (y > 0)     ? wave_u[y-1][x] : 0.0f;
+            float down  = (y < H-1)   ? wave_u[y+1][x] : 0.0f;
+            float left  = (x > 0)     ? wave_u[y][x-1] : 0.0f;
+            float right = (x < W-1)   ? wave_u[y][x+1] : 0.0f;
+            float lap = (up + down + left + right) - 4.0f * center;
+
+            /* Update velocity with wave equation + damping */
+            wave_v[y][x] = WAVE_DAMPING * (wave_v[y][x] + WAVE_SPEED * lap);
+
+            /* Update amplitude */
+            wave_u_new[y][x] = center + wave_v[y][x];
+
+            /* Soft clamp to prevent runaway */
+            if (wave_u_new[y][x] > 2.0f) wave_u_new[y][x] = 2.0f;
+            if (wave_u_new[y][x] < -2.0f) wave_u_new[y][x] = -2.0f;
+        }
+    }
+    memcpy(wave_u, wave_u_new, sizeof(wave_u));
+
+    /* Save current grid for next frame's birth/death detection */
+    memcpy(wave_prev, grid, sizeof(wave_prev));
+    wave_has_prev = 1;
+    wave_n_sources = sources;
+
+    /* Compute statistics */
+    double sum_e = 0.0, sum_a = 0.0;
+    float mx = 0.0f;
+    int n_active = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float u = wave_u[y][x];
+            float v = wave_v[y][x];
+            float amp = fabsf(u);
+            if (amp > 0.001f || fabsf(v) > 0.001f) {
+                /* Energy = kinetic (v²) + potential (u²) */
+                sum_e += v * v + u * u;
+                sum_a += amp;
+                n_active++;
+                if (amp > mx) mx = amp;
+            }
+        }
+    }
+
+    wave_energy = (float)sum_e;
+    wave_max_amp = mx;
+    wave_mean_amp = n_active > 0 ? (float)(sum_a / n_active) : 0.0f;
+
+    /* Estimate dominant wavelength from zero-crossing spacing */
+    {
+        int crossings = 0;
+        for (int y = H / 4; y < 3 * H / 4; y++) {
+            for (int x = 1; x < W; x++) {
+                if ((wave_u[y][x] > 0) != (wave_u[y][x-1] > 0))
+                    crossings++;
+            }
+        }
+        int scan_width = W * (H / 2);
+        if (crossings > 2) {
+            wave_dom_wl = (float)scan_width / (crossings / 2.0f);
+            if (wave_dom_wl > 200.0f) wave_dom_wl = 200.0f;
+        } else {
+            wave_dom_wl = 0.0f;
+        }
+    }
+
+    /* Estimate propagation speed from wavefront advance */
+    /* Simplified: use theoretical c = sqrt(WAVE_SPEED) in cells/gen */
+    wave_speed_est = sqrtf(WAVE_SPEED);
+
+    /* Record sparkline history */
+    wave_hist_energy[wave_hist_idx] = wave_energy > 0 ? log10f(wave_energy + 1.0f) : 0.0f;
+    wave_hist_amp[wave_hist_idx] = wave_max_amp;
+    wave_hist_idx = (wave_hist_idx + 1) % WAVE_HIST_LEN;
+    if (wave_hist_count < WAVE_HIST_LEN) wave_hist_count++;
+
+    wave_stale = 0;
+}
+
+/* Wave amplitude to RGB:
+   deep orange (strong negative) → dark (zero) → bright cyan (strong positive)
+   with intermediate blue/teal tones for medium amplitudes. */
+static RGB wave_to_rgb(float amp) {
+    /* Normalize to ±1 range based on typical amplitudes */
+    float a = amp / 1.0f;
+    if (a > 1.0f) a = 1.0f;
+    if (a < -1.0f) a = -1.0f;
+
+    if (a > 0.02f) {
+        /* Positive: dark → teal → cyan → white */
+        float t = a;
+        if (t < 0.15f) {
+            float u = t / 0.15f;
+            return (RGB){(unsigned char)(5 + 15 * u),
+                         (unsigned char)(15 + 50 * u),
+                         (unsigned char)(25 + 60 * u)};
+        } else if (t < 0.5f) {
+            float u = (t - 0.15f) / 0.35f;
+            return (RGB){(unsigned char)(20 + 20 * u),
+                         (unsigned char)(65 + 100 * u),
+                         (unsigned char)(85 + 100 * u)};
+        } else {
+            float u = (t - 0.5f) / 0.5f;
+            return (RGB){(unsigned char)(40 + 120 * u),
+                         (unsigned char)(165 + 80 * u),
+                         (unsigned char)(185 + 70 * u)};
+        }
+    } else if (a < -0.02f) {
+        /* Negative: dark → warm orange → bright orange */
+        float t = -a;
+        if (t < 0.15f) {
+            float u = t / 0.15f;
+            return (RGB){(unsigned char)(25 + 55 * u),
+                         (unsigned char)(12 + 25 * u),
+                         (unsigned char)(5 + 8 * u)};
+        } else if (t < 0.5f) {
+            float u = (t - 0.15f) / 0.35f;
+            return (RGB){(unsigned char)(80 + 90 * u),
+                         (unsigned char)(37 + 50 * u),
+                         (unsigned char)(13 + 10 * u)};
+        } else {
+            float u = (t - 0.5f) / 0.5f;
+            return (RGB){(unsigned char)(170 + 75 * u),
+                         (unsigned char)(87 + 80 * u),
+                         (unsigned char)(23 + 50 * u)};
+        }
+    } else {
+        /* Near-zero: very dark */
+        return (RGB){6, 6, 8};
+    }
+}
+
 /* ── Mutual Information Network computation ──────────────────────────────── */
 
 /* Draw a Bresenham line on mi_overlay, keeping max MI at each cell */
@@ -5477,8 +5692,6 @@ static int flash_active(void) {
 static int cell_color(int x, int y, RGB *out);
 
 /* ── Frame capture (PPM screenshot) ────────────────────────────────────────── */
-
-static int frame_counter = 0;
 
 static int next_frame_number(void) {
     char path[64];
@@ -7011,6 +7224,22 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Wave mechanics overlay: interference pattern from birth/death impulses */
+    if (wave_mode) {
+        float amp = wave_u[y][x];
+        if (fabsf(amp) > 0.005f || grid[y][x]) {
+            *out = wave_to_rgb(amp);
+            if (grid[y][x]) {
+                /* Brighten live cells */
+                out->r = (unsigned char)(out->r < 200 ? out->r + 55 : 255);
+                out->g = (unsigned char)(out->g < 200 ? out->g + 55 : 255);
+                out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
+            }
+            return grid[y][x] ? 1 : 25; /* 25 = wave ghost */
+        }
+        return 0;
+    }
+
     /* Renormalization group flow overlay: multi-scale structure */
     if (rg_mode) {
         if (grid[y][x]) {
@@ -7316,6 +7545,13 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[%sm\xe2\x97\x86" "dS%s%.3f\033[0m", clr, arrow, eprod_global);
     }
 
+    /* Wave mechanics indicator */
+    char wave_str[96] = "";
+    if (wave_mode) {
+        snprintf(wave_str, sizeof(wave_str),
+                 " \033[38;2;40;200;220m\xe2\x97\x86\xe2\x89\x88%.1fE\033[0m", wave_energy);
+    }
+
     /* Probe mode indicator */
     char probe_str[96] = "";
     if (probe_mode == 1)
@@ -7400,7 +7636,6 @@ static void render(int running, int speed_ms, int draw_mode) {
                 if (t > 0.001f) { t_sum += t; t_nonzero++; }
                 if (t + temp_global > eff_max) eff_max = t + temp_global;
             }
-        float t_mean = t_nonzero > 0 ? t_sum / t_nonzero : 0.0f;
         snprintf(temp_str, sizeof(temp_str),
                  " \033[38;2;255;120;60m\xe2\x96\x93" "TEMP:G%.2f B%.2f\033[0m",
                  temp_global, temp_brush);
@@ -7445,9 +7680,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -8533,7 +8768,6 @@ static void render(int running, int speed_ms, int draw_mode) {
                 float lx = lx_min + (float)px / 39.0f * lx_range;
                 /* predicted: log(N) = log(N_intercept) - D_box * log(eps) */
                 /* Use regression: y = sum_y/n + slope * (x - sum_x/n) */
-                float pred_ly = ly_max - fractal_dbox * (lx - lx_min);
                 /* Actually use proper regression */
                 int n_valid = 0;
                 float sx = 0, sy2 = 0;
@@ -10139,11 +10373,142 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", erst);
     }
 
+    /* ── Wave Mechanics overlay panel ────────────────────────────────────── */
+    if (wave_mode) {
+        int wv_w = 44;
+        int wv_col = term_cols - wv_w - 2;
+        /* Stack below other active panels */
+        int wv_row = 3;
+        if (entropy_mode)   wv_row += 8;
+        if (temp_mode)      wv_row += 9;
+        if (lyapunov_mode)  wv_row += 8;
+        if (fourier_mode)   wv_row += 18;
+        if (fractal_mode)   wv_row += 11;
+        if (wolfram_mode)   wv_row += 14;
+        if (flow_mode)      wv_row += 9;
+        if (attractor_mode) wv_row += 8;
+        if (cone_mode >= 1) wv_row += 8;
+        if (surp_mode)      wv_row += 8;
+        if (mi_mode)        wv_row += 12;
+        if (cplx_mode)      wv_row += 11;
+        if (topo_mode)      wv_row += 11;
+        if (rg_mode)        wv_row += 11;
+        if (kc_mode)        wv_row += 9;
+        if (corr_mode)      wv_row += 9;
+        if (eprod_mode)     wv_row += 9;
+        if (wv_col < 1) wv_col = 1;
+
+        const char *wbdr = "\033[38;2;40;180;200;48;2;4;12;14m";
+        const char *wbg  = "\033[48;2;4;12;14m";
+        const char *wrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x89\x88 Wave Mechanics ",
+                     wv_row, wv_col, wbdr);
+        for (int i = 24; i < wv_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", wrst);
+
+        /* Row 1: Energy & max amplitude */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wv_row + 1, wv_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;100;180;200mEnergy:");
+        p += sprintf(p, "\033[1;38;2;40;220;240m%.1f", wave_energy);
+        p += sprintf(p, "\033[0;38;2;80;120;140m  max:");
+        p += sprintf(p, "\033[38;2;200;240;255m%.3f", wave_max_amp);
+        p += sprintf(p, "%s", wbg);
+        { int used = 30; for (int i = used; i < wv_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 2: Wavelength & speed */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wv_row + 2, wv_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;100;180;200m\xce\xbb\xe2\x89\x88");
+        if (wave_dom_wl > 0.5f)
+            p += sprintf(p, "\033[38;2;200;220;255m%.1f", wave_dom_wl);
+        else
+            p += sprintf(p, "\033[38;2;80;80;100m---");
+        p += sprintf(p, "\033[38;2;80;120;140m cells  c=");
+        p += sprintf(p, "\033[38;2;200;220;255m%.2f", wave_speed_est);
+        p += sprintf(p, "\033[38;2;80;120;140m cells/gen");
+        p += sprintf(p, "%s", wbg);
+        { int used = 36; for (int i = used; i < wv_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 3: Sources this frame */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wv_row + 3, wv_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;100;180;200mSources:");
+        p += sprintf(p, "\033[38;2;200;200;255m%d", wave_n_sources);
+        p += sprintf(p, "\033[38;2;80;120;140m impulses  ");
+        p += sprintf(p, "\033[38;2;40;200;220m+birth ");
+        p += sprintf(p, "\033[38;2;220;140;40m-death");
+        p += sprintf(p, "%s", wbg);
+        { int used = 38; for (int i = used; i < wv_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 4: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wv_row + 4, wv_col, wbdr, wbg);
+        p += sprintf(p, " ");
+        /* Draw color gradient bar */
+        for (int i = 0; i < 30; i++) {
+            float a = (i - 15) / 15.0f;
+            RGB c = wave_to_rgb(a);
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", c.r, c.g, c.b);
+        }
+        p += sprintf(p, "%s", wbg);
+        { int used = 31; for (int i = used; i < wv_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 5: Energy sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wv_row + 5, wv_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;60;120;140mE ");
+        if (wave_hist_count > 1) {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int n = wave_hist_count < 30 ? wave_hist_count : 30;
+            float hmax = 0.001f;
+            for (int i = 0; i < n; i++) {
+                int idx = (wave_hist_idx - n + i + WAVE_HIST_LEN) % WAVE_HIST_LEN;
+                if (wave_hist_energy[idx] > hmax) hmax = wave_hist_energy[idx];
+            }
+            for (int i = 0; i < n; i++) {
+                int idx = (wave_hist_idx - n + i + WAVE_HIST_LEN) % WAVE_HIST_LEN;
+                float v = wave_hist_energy[idx] / hmax;
+                int lvl = (int)(v * 7.0f);
+                if (lvl > 7) lvl = 7;
+                if (lvl < 0) lvl = 0;
+                if (v > 0.6f) p += sprintf(p, "\033[38;2;40;220;240m%s", spark_chars[lvl]);
+                else if (v > 0.2f) p += sprintf(p, "\033[38;2;30;140;180m%s", spark_chars[lvl]);
+                else p += sprintf(p, "\033[38;2;20;60;80m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", wbg);
+        { int used = 2 + (wave_hist_count < 30 ? wave_hist_count : 30);
+          for (int i = used; i < wv_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 6: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wv_row + 6, wv_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;60;100;120m[~]toggle  wave interference field");
+        { int used = 37; for (int i = used; i < wv_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", wv_row + 7, wv_col, wbdr);
+        for (int i = 0; i < wv_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", wrst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
-        int pp_h = 30; /* total rows including borders */
-        /* Center panel vertically, place on left side to avoid overlay panel stacking on right */
+        /* Place on left side to avoid overlay panel stacking on right */
         int pp_col = 2;
         int pp_row = 3;
         if (pp_col < 1) pp_col = 1;
@@ -10387,6 +10752,26 @@ static void render(int running, int speed_ms, int draw_mode) {
                          ep > 0.05f ? "dissolving" : ep < -0.05f ? "ordering" : "stable", prst);
             p += sprintf(p, "%s", pbg);
             PROBE_PAD(34);
+        }
+        PROBE_ROW_END();
+
+        /* Row 12d: Wave amplitude */
+        PROBE_ROW_START();
+        {
+            float wa = wave_u[py][px];
+            float wv = wave_v[py][px];
+            p += sprintf(p, " %sWave:%s        ", plbl, prst);
+            if (wa > 0.05f) p += sprintf(p, "\033[38;2;40;220;240m");
+            else if (wa < -0.05f) p += sprintf(p, "\033[38;2;220;140;40m");
+            else p += sprintf(p, "\033[38;2;100;100;110m");
+            p += sprintf(p, "%+.3f", wa);
+            p += sprintf(p, " %sv:%s", pdim, prst);
+            if (fabsf(wv) > 0.01f)
+                p += sprintf(p, "\033[38;2;160;200;220m%+.3f", wv);
+            else
+                p += sprintf(p, "\033[38;2;80;80;90m%+.3f", wv);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(32);
         }
         PROBE_ROW_END();
 
@@ -11114,6 +11499,12 @@ int main(int argc, char **argv) {
                 eprod_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '~') {
+            wave_mode = !wave_mode;
+            if (wave_mode) {
+                wave_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -11629,6 +12020,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh entropy production rate every 2 generations (needs frequent updates) */
         if (eprod_mode && eprod_stale && (generation % 2 == 0 || !running)) {
             eprod_compute();
+        }
+
+        /* Auto-refresh wave mechanics every generation (continuous propagation) */
+        if (wave_mode && wave_stale) {
+            wave_compute();
         }
 
         render(running, speed_ms, draw_mode);
