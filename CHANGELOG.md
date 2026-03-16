@@ -1,8 +1,22 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~12,756 lines
-(Round 47).
+features. The project grew from ~790 lines (Round 1) to ~13,013 lines
+(Round 48).
+
+## Round 48 — Split-Screen Dual Overlay Comparison
+
+Side-by-side comparison mode for any two of the 20 analysis overlays.
+Toggle with `)` — divides the viewport vertically with a thin divider.
+TAB cycles the right panel's overlay through all 21 options (None + 20
+overlays); backtick cycles the left panel. Initializes intelligently:
+left = current active overlay, right = next in list. Status bar shows
+`SPLIT:LeftName|RightName` indicator. Overlay stats panels hidden in
+split mode to keep the view clean. Works at zoom==1 (default); higher
+zooms render normally. Pure rendering composition — no new analysis math,
+just a UI layer that multiplies the value of all existing overlays by
+enabling direct comparison (e.g., entropy vs. vorticity, wave mechanics
+vs. ergodicity). +256 lines.
 
 ## Round 47 — Ergodicity Metric
 
