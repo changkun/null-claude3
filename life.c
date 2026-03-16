@@ -868,6 +868,45 @@ static int   gd_qy[MAX_W * MAX_H];
 
 static void  gd_compute(void);
 
+/* ── Recurrence Plot ──────────────────────────────────────────────────────── */
+/* 64-step recurrence matrix from 16-metric state vectors.  Entry (i,j) is
+   colored by the distance between the system's state at time i and time j.
+   Dark pixels = similar states (recurrence).  Reveals periodic orbits
+   (diagonal lines), chaotic regimes (scattered points), laminar phases
+   (horizontal/vertical bands), and regime transitions.
+   Toggle with 'R' key.  Overlay index 26. */
+
+#define RP_SIZE  64         /* recurrence matrix dimension (time steps) */
+#define RP_N     PP_N_METRICS  /* 16 metrics per state vector */
+#define RP_DISP  32         /* display resolution (downsampled for sidebar) */
+
+static int   rp_mode = 0;           /* 0=off, 1=on */
+static int   rp_stale = 1;
+static float rp_buf[RP_SIZE][RP_N]; /* ring buffer of state vectors */
+static int   rp_head = 0;           /* next write position */
+static int   rp_count = 0;          /* valid entries (≤ RP_SIZE) */
+static float rp_dist[RP_SIZE][RP_SIZE]; /* normalized distance matrix (0..1) */
+static float rp_max_dist = 0.0f;    /* max raw distance in matrix */
+
+/* RQA statistics */
+static float rp_rr = 0.0f;         /* recurrence rate (%) */
+static float rp_det = 0.0f;        /* determinism (%) */
+static float rp_lam = 0.0f;        /* laminarity (%) */
+static int   rp_lmax = 0;          /* longest diagonal line */
+static float rp_tt = 0.0f;         /* trapping time */
+static float rp_thresh = 0.10f;    /* recurrence threshold (fraction of max dist) */
+
+static void  rp_record(void);
+static void  rp_compute(void);
+static void  rp_reset(void) {
+    rp_head = 0; rp_count = 0; rp_stale = 1;
+    rp_rr = rp_det = rp_lam = rp_tt = 0.0f;
+    rp_lmax = 0; rp_max_dist = 0.0f;
+    for (int i = 0; i < RP_SIZE; i++)
+        for (int j = 0; j < RP_SIZE; j++)
+            rp_dist[i][j] = 0.0f;
+}
+
 /* ── Spacetime Kymograph ─────────────────────────────────────────────────── */
 /* Displays a 1D horizontal slice of the grid evolving over time as a 2D
    spacetime diagram.  Y-axis = time (scrolling upward), X-axis = grid row.
@@ -903,7 +942,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 26
+#define N_SPLIT_OVERLAYS 27
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -936,6 +975,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Persistence",   ':' },  /* 23 */
     { "CorrMatrix",   '\'' },  /* 24 */
     { "Geodesic",     '"'  },  /* 25 */
+    { "Recurrence",   'o'  },  /* 26 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -993,6 +1033,7 @@ static void split_set_overlay(int idx) {
     rg_mode = 0; kc_mode = 0; corr_mode = 0; eprod_mode = 0;
     wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
     perc_mode = 0; ising_mode = 0; pb_mode = 0; cm_mode = 0; gd_mode = 0;
+    rp_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1021,6 +1062,7 @@ static void split_set_overlay(int idx) {
         case 23: pb_mode = 1; break;
         case 24: cm_mode = 1; break;
         case 25: gd_mode = 2; break;
+        case 26: rp_mode = 1; break;
     }
 }
 
@@ -1050,6 +1092,7 @@ static int split_detect_current(void) {
     if (pb_mode) return 23;
     if (cm_mode) return 24;
     if (gd_mode) return 25;
+    if (rp_mode) return 26;
     return 0;
 }
 
@@ -1360,6 +1403,116 @@ static void cm_compute(void) {
         }
     }
     cm_stale = 0;
+}
+
+/* ── Recurrence Plot implementations ──────────────────────────────────────── */
+
+static void rp_record(void) {
+    for (int i = 0; i < RP_N; i++)
+        rp_buf[rp_head][i] = pp_read_metric(i);
+    rp_head = (rp_head + 1) % RP_SIZE;
+    if (rp_count < RP_SIZE) rp_count++;
+    rp_stale = 1;
+}
+
+static void rp_compute(void) {
+    if (rp_count < 4) { rp_stale = 0; return; }
+    int n = rp_count;
+
+    /* Find min/max for each metric for normalization */
+    float mn[RP_N], mx[RP_N];
+    for (int m = 0; m < RP_N; m++) { mn[m] = 1e30f; mx[m] = -1e30f; }
+    for (int k = 0; k < n; k++) {
+        int idx = (rp_head - n + k + RP_SIZE) % RP_SIZE;
+        for (int m = 0; m < RP_N; m++) {
+            if (rp_buf[idx][m] < mn[m]) mn[m] = rp_buf[idx][m];
+            if (rp_buf[idx][m] > mx[m]) mx[m] = rp_buf[idx][m];
+        }
+    }
+    float range[RP_N];
+    for (int m = 0; m < RP_N; m++) {
+        range[m] = mx[m] - mn[m];
+        if (range[m] < 1e-12f) range[m] = 1.0f;
+    }
+
+    /* Compute pairwise Euclidean distance in normalized metric space */
+    float raw_max = 0.0f;
+    for (int i = 0; i < n; i++) {
+        int ii = (rp_head - n + i + RP_SIZE) % RP_SIZE;
+        rp_dist[i][i] = 0.0f;
+        for (int j = i + 1; j < n; j++) {
+            int jj = (rp_head - n + j + RP_SIZE) % RP_SIZE;
+            float d2 = 0.0f;
+            for (int m = 0; m < RP_N; m++) {
+                float di = (rp_buf[ii][m] - mn[m]) / range[m];
+                float dj = (rp_buf[jj][m] - mn[m]) / range[m];
+                float diff = di - dj;
+                d2 += diff * diff;
+            }
+            float d = sqrtf(d2);
+            rp_dist[i][j] = rp_dist[j][i] = d;
+            if (d > raw_max) raw_max = d;
+        }
+    }
+    rp_max_dist = raw_max;
+
+    /* Normalize distances to 0..1 */
+    if (raw_max > 1e-12f) {
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                rp_dist[i][j] /= raw_max;
+    }
+
+    /* RQA: Recurrence Rate — fraction of matrix below threshold */
+    float eps = rp_thresh;
+    int rec_total = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            if (rp_dist[i][j] <= eps) rec_total++;
+    rp_rr = 100.0f * rec_total / (float)(n * n);
+
+    /* RQA: Determinism — fraction of recurrent points on diagonal lines (len≥2) */
+    int det_pts = 0, diag_rec = 0;
+    rp_lmax = 0;
+    for (int d = -(n - 1); d < n; d++) {
+        int run = 0;
+        int i0 = (d >= 0) ? 0 : -d;
+        int j0 = (d >= 0) ? d : 0;
+        for (int k = 0; i0 + k < n && j0 + k < n; k++) {
+            if (rp_dist[i0 + k][j0 + k] <= eps) {
+                run++;
+                diag_rec++;
+            } else {
+                if (run >= 2) det_pts += run;
+                if (run > rp_lmax) rp_lmax = run;
+                run = 0;
+            }
+        }
+        if (run >= 2) det_pts += run;
+        if (run > rp_lmax) rp_lmax = run;
+    }
+    rp_det = (diag_rec > 0) ? 100.0f * det_pts / (float)diag_rec : 0.0f;
+
+    /* RQA: Laminarity — fraction of recurrent points on vertical lines (len≥2) */
+    int lam_pts = 0, vert_rec = 0;
+    float tt_sum = 0.0f; int tt_count = 0;
+    for (int j = 0; j < n; j++) {
+        int run = 0;
+        for (int i = 0; i < n; i++) {
+            if (rp_dist[i][j] <= eps) {
+                run++;
+                vert_rec++;
+            } else {
+                if (run >= 2) { lam_pts += run; tt_sum += run; tt_count++; }
+                run = 0;
+            }
+        }
+        if (run >= 2) { lam_pts += run; tt_sum += run; tt_count++; }
+    }
+    rp_lam = (vert_rec > 0) ? 100.0f * lam_pts / (float)vert_rec : 0.0f;
+    rp_tt = (tt_count > 0) ? tt_sum / tt_count : 0.0f;
+
+    rp_stale = 0;
 }
 
 /* Forward declarations for emitter/absorber use */
@@ -2765,6 +2918,7 @@ static void demo_reset_overlays(void) {
     pp_mode = 0;
     cm_mode = 0;
     gd_mode = 0;
+    rp_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -7114,6 +7268,7 @@ static void split_ensure_computed(int idx) {
         case 23: if (pb_stale) pb_compute(); break;
         case 24: if (cm_stale && cm_count >= 4) cm_compute(); break;
         case 25: if (gd_stale && gd_seed_x >= 0) gd_compute(); break;
+        case 26: if (rp_stale && rp_count >= 4) rp_compute(); break;
         default: break;
     }
 }
@@ -9096,6 +9251,14 @@ static void render(int running, int speed_ms, int draw_mode) {
                  cm_count, CM_WINDOW);
     }
 
+    /* Recurrence plot indicator */
+    char rp_str[96] = "";
+    if (rp_mode) {
+        snprintf(rp_str, sizeof(rp_str),
+                 " \033[38;2;180;60;220m\xe2\x96\xa6" "REC:%d/%d\033[0m",
+                 rp_count, RP_SIZE);
+    }
+
     /* Split-screen indicator */
     char split_str[128] = "";
     if (split_mode) {
@@ -9242,9 +9405,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, rp_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -9297,7 +9460,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     int split_saved_surp, split_saved_mi, split_saved_cplx, split_saved_topo;
     int split_saved_rg, split_saved_kc, split_saved_corr, split_saved_eprod;
     int split_saved_wave, split_saved_vort, split_saved_ergo, split_saved_census;
-    int split_saved_perc, split_saved_ising, split_saved_pb, split_saved_gd;
+    int split_saved_perc, split_saved_ising, split_saved_pb, split_saved_gd, split_saved_rp;
     int split_mid = view_w / 2; /* column divider position */
 
     if (split_mode) {
@@ -9316,6 +9479,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         split_saved_ising = ising_mode;
         split_saved_pb = pb_mode;
         split_saved_gd = gd_mode;
+        split_saved_rp = rp_mode;
 
         /* Ensure data is computed for both panels */
         split_ensure_computed(split_left);
@@ -9575,6 +9739,7 @@ static void render(int running, int speed_ms, int draw_mode) {
             ising_mode = split_saved_ising;
             pb_mode = split_saved_pb;
             gd_mode = split_saved_gd;
+            rp_mode = split_saved_rp;
         } else {
         /* Normal (non-split) rendering */
         for (int row = 0; row < usable_rows && row < view_h; row++) {
@@ -13717,6 +13882,205 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", crst);
     }
 
+    /* ── Recurrence Plot sidebar panel ─────────────────────────────────── */
+    if (rp_mode && rp_count >= 4) {
+        int rp_pw = 38;  /* panel width */
+        int rp_col = term_cols - rp_pw - 2;
+        int rp_row_p = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   rp_row_p += 8;
+        if (temp_mode)      rp_row_p += 9;
+        if (lyapunov_mode)  rp_row_p += 8;
+        if (fourier_mode)   rp_row_p += 18;
+        if (fractal_mode)   rp_row_p += 11;
+        if (wolfram_mode)   rp_row_p += 14;
+        if (flow_mode)      rp_row_p += 9;
+        if (attractor_mode) rp_row_p += 8;
+        if (cone_mode)      rp_row_p += 12;
+        if (surp_mode)      rp_row_p += 8;
+        if (mi_mode)        rp_row_p += 8;
+        if (cplx_mode)      rp_row_p += 8;
+        if (topo_mode)      rp_row_p += 10;
+        if (rg_mode)        rp_row_p += 12;
+        if (kc_mode)        rp_row_p += 11;
+        if (corr_mode)      rp_row_p += 10;
+        if (eprod_mode)     rp_row_p += 8;
+        if (vort_mode)      rp_row_p += 8;
+        if (wave_mode)      rp_row_p += 8;
+        if (ergo_mode)      rp_row_p += 10;
+        if (perc_mode)      rp_row_p += 10;
+        if (ising_mode)     rp_row_p += 10;
+        if (pb_mode)        rp_row_p += 14;
+        if (gd_mode >= 2)   rp_row_p += 8;
+        if (pp_mode)        rp_row_p += 18;
+        if (cm_mode && cm_count >= 4) rp_row_p += 8 + CM_N;
+        if (rp_col < 1) rp_col = 1;
+
+        const char *rpbdr = "\033[38;2;180;60;220;48;2;12;6;18m";
+        const char *rpbg  = "\033[48;2;12;6;18m";
+        const char *rprst = "\033[0m";
+
+        int n = rp_count;
+        int dsp = RP_DISP;  /* 32 display cells */
+        if (dsp > n) dsp = n;
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Recurrence Plot ",
+                     rp_row_p, rp_col, rpbdr);
+        for (int i = 19; i < rp_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rprst);
+
+        /* Row 1: Window info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row_p + 1, rp_col, rpbdr, rpbg);
+        {
+            int nn = sprintf(p, " \033[38;2;200;140;240mFrames: %d/%d  "
+                                "\033[38;2;140;100;160m\xce\xb5=%.0f%%  [o]exit",
+                             rp_count, RP_SIZE, rp_thresh * 100.0f);
+            p += nn;
+            int used = 30 + (rp_count >= 10 ? 1 : 0) + (rp_count >= 100 ? 1 : 0);
+            for (int i = used; i < rp_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rpbdr, rprst);
+
+        /* Recurrence matrix: dsp×dsp downsampled, rendered with half-blocks
+           (2 vertical pixels per character row) → dsp/2 character rows */
+        int char_rows = (dsp + 1) / 2;
+        for (int cr = 0; cr < char_rows; cr++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                         rp_row_p + 2 + cr, rp_col, rpbdr, rpbg);
+            for (int c = 0; c < dsp; c++) {
+                /* Map display coords to matrix coords */
+                int mi_top = cr * 2 * n / dsp;
+                int mj = c * n / dsp;
+                int mi_bot = (cr * 2 + 1) * n / dsp;
+
+                /* Top pixel color (distance → color) */
+                float d_top = rp_dist[mi_top][mj];
+                int tr, tg, tb;
+                if (d_top <= rp_thresh) {
+                    /* Recurrent: dark purple/magenta */
+                    float t = d_top / (rp_thresh + 1e-6f);
+                    tr = (int)(40 + 80 * t); tg = (int)(10 * t); tb = (int)(60 + 100 * t);
+                } else {
+                    /* Non-recurrent: gray → warm */
+                    float t = (d_top - rp_thresh) / (1.0f - rp_thresh + 1e-6f);
+                    if (t > 1.0f) t = 1.0f;
+                    tr = (int)(50 + 180 * t); tg = (int)(40 + 100 * t); tb = (int)(60 * (1.0f - t));
+                }
+                if (tr < 0) tr = 0; if (tr > 255) tr = 255;
+                if (tg < 0) tg = 0; if (tg > 255) tg = 255;
+                if (tb < 0) tb = 0; if (tb > 255) tb = 255;
+
+                /* Bottom pixel color */
+                float d_bot = (mi_bot < n) ? rp_dist[mi_bot][mj] : 0.0f;
+                int br, bg2, bb;
+                if (cr * 2 + 1 >= dsp) {
+                    /* Beyond matrix: use background */
+                    br = 12; bg2 = 6; bb = 18;
+                } else if (d_bot <= rp_thresh) {
+                    float t = d_bot / (rp_thresh + 1e-6f);
+                    br = (int)(40 + 80 * t); bg2 = (int)(10 * t); bb = (int)(60 + 100 * t);
+                } else {
+                    float t = (d_bot - rp_thresh) / (1.0f - rp_thresh + 1e-6f);
+                    if (t > 1.0f) t = 1.0f;
+                    br = (int)(50 + 180 * t); bg2 = (int)(40 + 100 * t); bb = (int)(60 * (1.0f - t));
+                }
+                if (br < 0) br = 0; if (br > 255) br = 255;
+                if (bg2 < 0) bg2 = 0; if (bg2 > 255) bg2 = 255;
+                if (bb < 0) bb = 0; if (bb > 255) bb = 255;
+
+                /* Half-block: fg=top, bg=bottom */
+                p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80",
+                             tr, tg, tb, br, bg2, bb);
+            }
+            /* Pad remaining width */
+            p += sprintf(p, "%s", rpbg);
+            {
+                int used = 1 + dsp;
+                for (int i = used; i < rp_pw - 1; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", rpbdr, rprst);
+        }
+
+        /* Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row_p + 2 + char_rows, rp_col, rpbdr, rpbg);
+        p += sprintf(p, " \033[38;2;100;40;120m");
+        for (int i = 1; i < rp_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rpbdr, rprst);
+
+        /* RQA Stats rows */
+        /* Row: RR% and DET% */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row_p + 3 + char_rows, rp_col, rpbdr, rpbg);
+        {
+            int nn = sprintf(p, " \033[38;2;255;180;60mRR%%\033[38;2;200;160;120m=%.1f"
+                                "  \033[38;2;100;220;255mDET%%\033[38;2;200;160;120m=%.1f",
+                             rp_rr, rp_det);
+            p += nn;
+            int used = 22;
+            for (int i = used; i < rp_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rpbdr, rprst);
+
+        /* Row: LAM% and TT */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row_p + 4 + char_rows, rp_col, rpbdr, rpbg);
+        {
+            int nn = sprintf(p, " \033[38;2;120;255;120mLAM%%\033[38;2;200;160;120m=%.1f"
+                                "  \033[38;2;255;120;180mTT\033[38;2;200;160;120m=%.1f",
+                             rp_lam, rp_tt);
+            p += nn;
+            int used = 21;
+            for (int i = used; i < rp_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rpbdr, rprst);
+
+        /* Row: L_max */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row_p + 5 + char_rows, rp_col, rpbdr, rpbg);
+        {
+            int nn = sprintf(p, " \033[38;2;200;200;255mL_max\033[38;2;200;160;120m=%d"
+                                "  \033[38;2;160;160;140mMax_d\033[38;2;200;160;120m=%.2f",
+                             rp_lmax, rp_max_dist);
+            p += nn;
+            int used = 22 + (rp_lmax >= 10 ? 1 : 0) + (rp_lmax >= 100 ? 1 : 0);
+            for (int i = used; i < rp_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rpbdr, rprst);
+
+        /* Regime classification row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row_p + 6 + char_rows, rp_col, rpbdr, rpbg);
+        {
+            const char *regime;
+            if (rp_det > 80.0f && rp_rr > 20.0f)
+                regime = "\033[38;2;100;255;100mPeriodic";
+            else if (rp_det > 50.0f && rp_lam > 50.0f)
+                regime = "\033[38;2;255;200;60mLaminar";
+            else if (rp_det < 30.0f && rp_rr < 10.0f)
+                regime = "\033[38;2;255;80;80mChaotic";
+            else if (rp_lam > 60.0f)
+                regime = "\033[38;2;180;140;255mTrapped";
+            else
+                regime = "\033[38;2;200;200;200mTransient";
+            int nn = sprintf(p, " \033[38;2;160;120;180mRegime: %s", regime);
+            p += nn;
+            int used = 20;
+            for (int i = used; i < rp_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rpbdr, rprst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94",
+                     rp_row_p + 7 + char_rows, rp_col, rpbdr);
+        for (int i = 0; i < rp_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rprst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
@@ -14850,6 +15214,17 @@ int main(int argc, char **argv) {
                 flash_set("Geodesic: click a live cell to set seed [\"]exit");
             }
         }
+        else if (key == 'o') {
+            rp_mode = !rp_mode;
+            if (rp_mode) {
+                rp_reset();
+                flash_set("Recurrence Plot: 64-step RQA [o]exit");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                flash_set("Recurrence Plot off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
         else if (key == '\\') {
             split_mode = !split_mode;
             if (split_mode) {
@@ -15459,6 +15834,14 @@ int main(int argc, char **argv) {
             cm_record();
             if (cm_stale && cm_count >= 4) {
                 cm_compute();
+            }
+        }
+
+        /* Recurrence plot: record state vector every 2 generations */
+        if (rp_mode && running && (generation % 2 == 0)) {
+            rp_record();
+            if (rp_stale && rp_count >= 4) {
+                rp_compute();
             }
         }
 
