@@ -1,8 +1,38 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~23,040 lines
-(Round 73).
+features. The project grew from ~790 lines (Round 1) to ~24,000 lines
+(Round 75).
+
+## Round 75 — Interface Roughness Analyzer Overlay
+
+Adds **interface roughness analysis** — a non-equilibrium surface growth
+physics diagnostic that measures the scaling exponents of cluster
+boundaries. Press `Ctrl-V` to identify boundary cells (alive with ≥1 dead
+von Neumann neighbor), construct a column height profile h(x) = topmost
+boundary y, then compute the interface width w(ℓ) at 7 window scales
+(2,4,8,...,128). Log-log regression of w(ℓ) vs ℓ yields the roughness
+exponent α, classifying interfaces into universality classes: SMOOTH
+(α≈0), KPZ (α≈0.33, Kardar-Parisi-Zhang), EDW-WILK (α≈0.5,
+Edwards-Wilkinson), or ANOMALOUS (α>0.5). Also tracks w(t) over time
+to estimate the growth exponent β, and reports fractal dimension
+d_f = 2−α of the boundary. Color scheme: cyan (smooth boundary) →
+amber (moderate roughness) → red (rough) → white-hot (very rough).
+Interior alive cells dimmed, nearby dead cells get faint ambient glow.
+Sidebar panel shows α with classification, interface width, boundary
+count, R² of fit, fractal dimension, growth exponent β, multi-scale
+w(ℓ) values, color legend, and dual sparklines (w(t) and α(t)
+history). Ghost layer #42. Pivots from the equilibrium stat-mech arc
+(R71-74) to non-equilibrium surface growth physics. 42nd analysis
+overlay. +350 lines.
+
+## Round 74 — Order Parameter Susceptibility Overlay
+
+Adds the **order parameter susceptibility** χ = N·Var(ρ) computed over
+sliding 8×8 spatial patches with a 64-frame rolling time window. Press
+`Ctrl-U` to measure proximity to phase transitions via the fluctuation-
+dissipation theorem. Includes the Binder cumulant U₄ for universal
+crossing diagnostics. Ghost layer #41. +250 lines.
 
 ## Round 73 — Spectral Gap Estimator Overlay
 

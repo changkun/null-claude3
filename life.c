@@ -137,6 +137,11 @@
  *   Ctrl-T      Toggle spectral gap estimator (Markov mixing rate per cell)
  *                 Estimates λ₂ of local transition matrix from observation
  *                 Indigo=critical(slow), teal=moderate, lime=fast mixing
+ *   Ctrl-U      Toggle order parameter susceptibility (χ=N·Var(ρ) phase map)
+ *                 Patches colored by temporal density variance → phase transition proximity
+ *   Ctrl-V      Toggle interface roughness analyzer (KPZ universality detection)
+ *                 Boundary cells colored by local height deviation
+ *                 Cyan=smooth, amber=moderate, red=rough; sidebar shows α,β,d_f
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -1059,7 +1064,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 40
+#define N_SPLIT_OVERLAYS 42
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1106,6 +1111,8 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "MeanField",    'F'-64 },  /* 37: Ctrl-F */
     { "RuleInfer",    'R'-64 },  /* 38: Ctrl-R */
     { "SpectGap",     'T'-64 },  /* 39: Ctrl-T */
+    { "Suscept",      'U'-64 },  /* 40: Ctrl-U */
+    { "Roughness",    'V'-64 },  /* 41: Ctrl-V */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1874,6 +1881,81 @@ static void su_reset(void) {
     memset(su_hist_binder, 0, sizeof(su_hist_binder));
 }
 
+/* ── Interface Roughness Analyzer ──────────────────────────────────────────── */
+/* Measures the scaling exponents of cluster boundaries to detect KPZ universality.
+   Identifies boundary cells (alive with ≥1 dead von Neumann neighbor), constructs
+   a column height profile h(x) = topmost boundary y per column, then computes the
+   interface width w(ℓ) = sqrt(⟨Var(h)⟩) at window sizes ℓ = 2,4,8,...,128.
+   Log-log regression of w(ℓ) vs ℓ yields the roughness exponent α:
+     α ≈ 0    → smooth interface
+     α ≈ 0.33 → KPZ universality (1+1D Kardar-Parisi-Zhang)
+     α ≈ 0.50 → Edwards-Wilkinson (linear diffusion)
+     α > 0.50 → anomalous roughening / quenched disorder
+   Also tracks w(t) over time to estimate growth exponent β.
+   Fractal dimension of boundary: d_f ≈ 2 − α.
+   Ghost code = 42.  Toggle with Ctrl-V key. */
+
+#define IR_N_SCALES  7       /* number of window sizes: 2,4,8,16,32,64,128 */
+#define IR_HIST_LEN  64      /* sparkline history length */
+
+static int   ir_mode = 0;
+static int   ir_stale = 1;
+
+/* Per-cell boundary flag and roughness value */
+static unsigned char ir_boundary[MAX_H][MAX_W];  /* 1=boundary cell */
+static float ir_cell[MAX_H][MAX_W];              /* per-cell roughness for rendering */
+
+/* Column height profile */
+static int   ir_height[MAX_W];     /* h(x) = topmost boundary y, -1 if none */
+static int   ir_n_boundary = 0;    /* total boundary cell count */
+static int   ir_n_columns = 0;     /* columns with valid height */
+
+/* Multi-scale interface width */
+static float ir_w[IR_N_SCALES];    /* w(ℓ) at each scale */
+static int   ir_scales[IR_N_SCALES]; /* ℓ values: 2,4,8,16,32,64,128 */
+
+/* Roughness exponent α (from log-log regression) */
+static float ir_alpha = 0.0f;      /* roughness exponent */
+static float ir_alpha_r2 = 0.0f;   /* R² of log-log fit */
+static float ir_fractal_dim = 1.0f;/* d_f = 2 − α */
+static float ir_total_width = 0.0f;/* global interface width */
+
+/* Growth exponent β tracking */
+static float ir_hist_w[IR_HIST_LEN];     /* w(t) sparkline */
+static float ir_hist_alpha[IR_HIST_LEN]; /* α(t) sparkline */
+static int   ir_hist_idx = 0;
+static int   ir_hist_count = 0;
+static float ir_beta = 0.0f;       /* growth exponent from log(w) vs log(t) */
+
+/* Classification string */
+static const char *ir_class_str = "UNKNOWN";
+static const char *ir_class_clr = "\033[38;2;128;128;128m";
+
+static void ir_compute(void);
+static void ir_reset(void) {
+    ir_stale = 1;
+    ir_n_boundary = 0;
+    ir_n_columns = 0;
+    ir_alpha = 0.0f;
+    ir_alpha_r2 = 0.0f;
+    ir_fractal_dim = 1.0f;
+    ir_total_width = 0.0f;
+    ir_beta = 0.0f;
+    ir_hist_idx = 0;
+    ir_hist_count = 0;
+    ir_class_str = "UNKNOWN";
+    ir_class_clr = "\033[38;2;128;128;128m";
+    memset(ir_boundary, 0, sizeof(ir_boundary));
+    memset(ir_cell, 0, sizeof(ir_cell));
+    memset(ir_height, 0, sizeof(ir_height));
+    memset(ir_w, 0, sizeof(ir_w));
+    memset(ir_hist_w, 0, sizeof(ir_hist_w));
+    memset(ir_hist_alpha, 0, sizeof(ir_hist_alpha));
+    /* Initialize scale array */
+    for (int i = 0; i < IR_N_SCALES; i++)
+        ir_scales[i] = 2 << i;  /* 2,4,8,16,32,64,128 */
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -2005,6 +2087,8 @@ static void split_set_overlay(int idx) {
     mf_mode = 0;
     ri_mode = 0;
     sg2_mode = 0;
+    su_mode = 0;
+    ir_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -2047,6 +2131,8 @@ static void split_set_overlay(int idx) {
         case 37: mf_mode = 1; break;
         case 38: ri_mode = 1; break;
         case 39: sg2_mode = 1; break;
+        case 40: su_mode = 1; break;
+        case 41: ir_mode = 1; break;
     }
 }
 
@@ -2091,6 +2177,7 @@ static int split_detect_current(void) {
     if (ri_mode) return 38;
     if (sg2_mode) return 39;
     if (su_mode) return 40;
+    if (ir_mode) return 41;
     return 0;
 }
 
@@ -3454,6 +3541,7 @@ static void grid_step(void) {
     ri_stale = 1;
     sg2_stale = 1;
     su_stale = 1;
+    ir_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -4356,6 +4444,8 @@ static void demo_reset_overlays(void) {
     mf_mode = 0;
     ri_mode = 0;
     sg2_mode = 0;
+    su_mode = 0;
+    ir_mode = 0;
 }
 
 static void demo_setup_scene(int idx) {
@@ -9417,6 +9507,265 @@ static void su_compute(void) {
     if (su_hist_count < SU_HIST_LEN) su_hist_count++;
 }
 
+/* ── Interface Roughness Analyzer computation ──────────────────────────────── */
+static void ir_compute(void) {
+    ir_stale = 0;
+
+    /* Initialize scales */
+    for (int i = 0; i < IR_N_SCALES; i++)
+        ir_scales[i] = 2 << i;  /* 2,4,8,16,32,64,128 */
+
+    /* Phase 1: Identify boundary cells (alive with ≥1 dead von Neumann neighbor) */
+    ir_n_boundary = 0;
+    memset(ir_boundary, 0, sizeof(unsigned char) * H * MAX_W);
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (!grid[y][x]) continue;
+            int is_bnd = 0;
+            /* Von Neumann neighbors (4-connected) */
+            if (y > 0 && !grid[y-1][x]) is_bnd = 1;
+            else if (y < H-1 && !grid[y+1][x]) is_bnd = 1;
+            else if (x > 0 && !grid[y][x-1]) is_bnd = 1;
+            else if (x < W-1 && !grid[y][x+1]) is_bnd = 1;
+            /* Edge cells are boundary */
+            else if (y == 0 || y == H-1 || x == 0 || x == W-1) is_bnd = 1;
+            if (is_bnd) {
+                ir_boundary[y][x] = 1;
+                ir_n_boundary++;
+            }
+        }
+    }
+
+    /* Phase 2: Build column height profile h(x) = topmost boundary y per column */
+    ir_n_columns = 0;
+    for (int x = 0; x < W; x++) {
+        ir_height[x] = -1;
+        for (int y = 0; y < H; y++) {
+            if (ir_boundary[y][x]) {
+                ir_height[x] = y;
+                ir_n_columns++;
+                break;
+            }
+        }
+    }
+
+    if (ir_n_columns < 4) {
+        /* Not enough data for roughness analysis */
+        memset(ir_cell, 0, sizeof(float) * H * MAX_W);
+        ir_alpha = 0.0f;
+        ir_alpha_r2 = 0.0f;
+        ir_total_width = 0.0f;
+        ir_fractal_dim = 1.0f;
+        ir_class_str = "EMPTY";
+        ir_class_clr = "\033[38;2;80;80;80m";
+        goto ir_history;
+    }
+
+    /* Build compact valid-height array for windowed analysis */
+    static int ir_valid_h[MAX_W];
+    int nv = 0;
+    for (int x = 0; x < W; x++) {
+        if (ir_height[x] >= 0) {
+            ir_valid_h[nv] = ir_height[x];
+            nv++;
+        }
+    }
+
+    /* Phase 3: Compute interface width w(ℓ) at multiple scales */
+    /* Global mean height */
+    float h_mean = 0.0f;
+    for (int i = 0; i < nv; i++) h_mean += (float)ir_valid_h[i];
+    h_mean /= (float)nv;
+
+    /* Global interface width */
+    float h_var = 0.0f;
+    for (int i = 0; i < nv; i++) {
+        float d = (float)ir_valid_h[i] - h_mean;
+        h_var += d * d;
+    }
+    h_var /= (float)nv;
+    ir_total_width = sqrtf(h_var);
+
+    /* Window-based width at each scale */
+    int n_valid_scales = 0;
+    for (int si = 0; si < IR_N_SCALES; si++) {
+        int L = ir_scales[si];
+        if (L > nv / 2) {
+            ir_w[si] = -1.0f;  /* insufficient data */
+            continue;
+        }
+
+        float sum_var = 0.0f;
+        int n_windows = 0;
+
+        for (int start = 0; start + L <= nv; start += L / 2) {
+            /* Compute local mean in window */
+            float lmean = 0.0f;
+            for (int j = start; j < start + L; j++)
+                lmean += (float)ir_valid_h[j];
+            lmean /= (float)L;
+
+            /* Compute local variance */
+            float lvar = 0.0f;
+            for (int j = start; j < start + L; j++) {
+                float d = (float)ir_valid_h[j] - lmean;
+                lvar += d * d;
+            }
+            lvar /= (float)L;
+
+            sum_var += lvar;
+            n_windows++;
+        }
+
+        if (n_windows > 0) {
+            ir_w[si] = sqrtf(sum_var / (float)n_windows);
+            n_valid_scales++;
+        } else {
+            ir_w[si] = -1.0f;
+        }
+    }
+
+    /* Phase 4: Log-log regression for roughness exponent α */
+    /* w(ℓ) ~ ℓ^α  →  log(w) = α·log(ℓ) + const */
+    if (n_valid_scales >= 3) {
+        float sum_lx = 0.0f, sum_ly = 0.0f;
+        float sum_lx2 = 0.0f, sum_lxy = 0.0f;
+        int npts = 0;
+
+        for (int si = 0; si < IR_N_SCALES; si++) {
+            if (ir_w[si] <= 0.0f) continue;
+            float lx = logf((float)ir_scales[si]);
+            float ly = logf(ir_w[si]);
+            sum_lx += lx;
+            sum_ly += ly;
+            sum_lx2 += lx * lx;
+            sum_lxy += lx * ly;
+            npts++;
+        }
+
+        if (npts >= 3) {
+            float denom = (float)npts * sum_lx2 - sum_lx * sum_lx;
+            if (fabsf(denom) > 1e-10f) {
+                ir_alpha = ((float)npts * sum_lxy - sum_lx * sum_ly) / denom;
+                float intercept = (sum_ly - ir_alpha * sum_lx) / (float)npts;
+
+                /* R² computation */
+                float mean_ly = sum_ly / (float)npts;
+                float ss_tot = 0.0f, ss_res = 0.0f;
+                for (int si = 0; si < IR_N_SCALES; si++) {
+                    if (ir_w[si] <= 0.0f) continue;
+                    float lx = logf((float)ir_scales[si]);
+                    float ly = logf(ir_w[si]);
+                    float pred = ir_alpha * lx + intercept;
+                    ss_res += (ly - pred) * (ly - pred);
+                    ss_tot += (ly - mean_ly) * (ly - mean_ly);
+                }
+                ir_alpha_r2 = (ss_tot > 1e-10f) ? 1.0f - ss_res / ss_tot : 0.0f;
+                if (ir_alpha_r2 < 0.0f) ir_alpha_r2 = 0.0f;
+            }
+        }
+    }
+
+    /* Clamp alpha to reasonable range */
+    if (ir_alpha < -0.5f) ir_alpha = -0.5f;
+    if (ir_alpha > 1.5f) ir_alpha = 1.5f;
+
+    /* Fractal dimension of boundary */
+    ir_fractal_dim = 2.0f - ir_alpha;
+    if (ir_fractal_dim < 1.0f) ir_fractal_dim = 1.0f;
+    if (ir_fractal_dim > 2.0f) ir_fractal_dim = 2.0f;
+
+    /* Phase 5: Classify universality class */
+    if (ir_alpha_r2 < 0.5f) {
+        ir_class_str = "NOISY";
+        ir_class_clr = "\033[38;2;128;128;128m";
+    } else if (ir_alpha < 0.15f) {
+        ir_class_str = "SMOOTH";
+        ir_class_clr = "\033[38;2;80;200;220m";
+    } else if (ir_alpha < 0.42f) {
+        ir_class_str = "KPZ";
+        ir_class_clr = "\033[38;2;255;180;40m";
+    } else if (ir_alpha < 0.58f) {
+        ir_class_str = "EDW-WILK";
+        ir_class_clr = "\033[38;2;120;220;80m";
+    } else {
+        ir_class_str = "ANOMALOUS";
+        ir_class_clr = "\033[38;2;255;80;80m";
+    }
+
+    /* Phase 6: Per-cell roughness value for rendering */
+    {
+        /* For boundary cells: color by local height deviation from local mean */
+        float max_dev = 1.0f;
+        /* Compute max deviation for normalization */
+        for (int i = 0; i < nv; i++) {
+            float d = fabsf((float)ir_valid_h[i] - h_mean);
+            if (d > max_dev) max_dev = d;
+        }
+
+        /* Per-cell: boundary cells get roughness value, non-boundary alive get dim,
+           dead cells near boundary get faint glow */
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (ir_boundary[y][x]) {
+                    /* Local deviation from mean height */
+                    float dev = fabsf((float)y - h_mean) / max_dev;
+                    if (dev > 1.0f) dev = 1.0f;
+                    ir_cell[y][x] = 0.2f + 0.8f * dev;
+                } else if (grid[y][x]) {
+                    /* Interior alive cell: dim */
+                    ir_cell[y][x] = 0.08f;
+                } else {
+                    /* Dead cell: check distance to nearest boundary for faint glow */
+                    int near = 0;
+                    for (int dy = -2; dy <= 2 && !near; dy++)
+                        for (int dx = -2; dx <= 2 && !near; dx++) {
+                            int ny = y + dy, nx = x + dx;
+                            if (ny >= 0 && ny < H && nx >= 0 && nx < W &&
+                                ir_boundary[ny][nx])
+                                near = 1;
+                        }
+                    ir_cell[y][x] = near ? 0.04f : 0.0f;
+                }
+            }
+        }
+    }
+
+ir_history:
+    /* Phase 7: Sparkline history */
+    ir_hist_w[ir_hist_idx] = ir_total_width;
+    ir_hist_alpha[ir_hist_idx] = ir_alpha;
+    ir_hist_idx = (ir_hist_idx + 1) % IR_HIST_LEN;
+    if (ir_hist_count < IR_HIST_LEN) ir_hist_count++;
+
+    /* Phase 8: Estimate growth exponent β from log(w) vs log(t) */
+    if (ir_hist_count >= 8) {
+        float sum_lt = 0.0f, sum_lw2 = 0.0f;
+        float sum_lt2 = 0.0f, sum_ltw = 0.0f;
+        int np = 0;
+
+        for (int i = 0; i < ir_hist_count; i++) {
+            int idx = (ir_hist_idx - ir_hist_count + i + IR_HIST_LEN) % IR_HIST_LEN;
+            float w = ir_hist_w[idx];
+            if (w <= 0.01f) continue;
+            float lt = logf((float)(i + 1));
+            float lw = logf(w);
+            sum_lt += lt;
+            sum_lw2 += lw;
+            sum_lt2 += lt * lt;
+            sum_ltw += lt * lw;
+            np++;
+        }
+
+        if (np >= 4) {
+            float denom = (float)np * sum_lt2 - sum_lt * sum_lt;
+            if (fabsf(denom) > 1e-10f)
+                ir_beta = ((float)np * sum_ltw - sum_lt * sum_lw2) / denom;
+        }
+    }
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -10714,6 +11063,7 @@ static void split_ensure_computed(int idx) {
         case 38: if (ri_stale) ri_compute(); break;
         case 39: if (sg2_stale) sg2_compute(); break;
         case 40: if (su_stale) su_compute(); break;
+        case 41: if (ir_stale) ir_compute(); break;
         default: break;
     }
 }
@@ -12771,6 +13121,56 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 41; /* 41 = susceptibility ghost */
+        }
+        return 0;
+    }
+
+    /* Interface Roughness Analyzer overlay: boundary roughness heatmap */
+    if (ir_mode) {
+        float v = ir_cell[y][x];
+        if (grid[y][x] || v > 0.02f) {
+            unsigned char r, g, b;
+            if (ir_boundary[y][x]) {
+                /* Boundary cells: terrain-like palette based on local roughness */
+                if (v < 0.3f) {
+                    /* Smooth boundary: cool cyan-teal */
+                    float t = v / 0.3f;
+                    r = (unsigned char)(10 + 30 * t);
+                    g = (unsigned char)(140 + 60 * t);
+                    b = (unsigned char)(180 + 40 * t);
+                } else if (v < 0.55f) {
+                    /* Moderate: teal → amber */
+                    float t = (v - 0.3f) / 0.25f;
+                    r = (unsigned char)(40 + 170 * t);
+                    g = (unsigned char)(200 - 20 * t);
+                    b = (unsigned char)(220 - 180 * t);
+                } else if (v < 0.8f) {
+                    /* Rough: amber → orange-red */
+                    float t = (v - 0.55f) / 0.25f;
+                    r = (unsigned char)(210 + 40 * t);
+                    g = (unsigned char)(180 - 100 * t);
+                    b = (unsigned char)(40 - 20 * t);
+                } else {
+                    /* Very rough: bright red → white-hot */
+                    float t = (v - 0.8f) / 0.2f;
+                    if (t > 1.0f) t = 1.0f;
+                    r = (unsigned char)(250);
+                    g = (unsigned char)(80 + 160 * t);
+                    b = (unsigned char)(20 + 210 * t);
+                }
+            } else if (grid[y][x]) {
+                /* Interior alive: dim warm glow */
+                r = 20; g = 18; b = 12;
+            } else {
+                /* Dead near boundary: very faint amber glow */
+                float t = v / 0.06f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(8 * t);
+                g = (unsigned char)(6 * t);
+                b = (unsigned char)(3 * t);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 42; /* 42 = roughness ghost */
         }
         return 0;
     }
@@ -19528,6 +19928,192 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", surst);
     }
 
+    /* ── Interface Roughness Analyzer overlay panel ──────────────────────── */
+    if (ir_mode) {
+        int ir_pw = 50;
+        int ir_col = term_cols - ir_pw - 2;
+        int ir_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   ir_row += 8;
+        if (temp_mode)      ir_row += 9;
+        if (lyapunov_mode)  ir_row += 8;
+        if (fourier_mode)   ir_row += 18;
+        if (fractal_mode)   ir_row += 11;
+        if (wolfram_mode)   ir_row += 14;
+        if (flow_mode)      ir_row += 9;
+        if (attractor_mode) ir_row += 8;
+        if (cone_mode >= 1) ir_row += 8;
+        if (surp_mode)      ir_row += 8;
+        if (mi_mode)        ir_row += 12;
+        if (cplx_mode)      ir_row += 11;
+        if (topo_mode)      ir_row += 11;
+        if (rg_mode)        ir_row += 11;
+        if (kc_mode)        ir_row += 9;
+        if (corr_mode)      ir_row += 9;
+        if (eprod_mode)     ir_row += 9;
+        if (vort_mode)      ir_row += 9;
+        if (wave_mode)      ir_row += 9;
+        if (ergo_mode)      ir_row += 10;
+        if (coh_mode)       ir_row += 8;
+        if (ce_mode)        ir_row += 9;
+        if (ew_mode)        ir_row += 10;
+        if (hr_mode)        ir_row += 10;
+        if (rd_mode)        ir_row += 13;
+        if (xc_mode && xc_count >= 20) ir_row += 28;
+        if (fi_mode && fi_count >= 16)  ir_row += 12;
+        if (sg_mode)        ir_row += 12;
+        if (td_mode)        ir_row += 10;
+        if (mf_mode)        ir_row += 10;
+        if (ri_mode)        ir_row += 10;
+        if (sg2_mode)       ir_row += 9;
+        if (su_mode)        ir_row += 9;
+        if (ir_col < 1) ir_col = 1;
+
+        const char *irbdr = "\033[38;2;40;180;200;48;2;8;14;16m";  /* teal border */
+        const char *irbg  = "\033[48;2;8;14;16m";
+        const char *irrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x96\x93 Roughness ",
+                     ir_row, ir_col, irbdr);
+        for (int i = 18; i < ir_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", irrst);
+
+        /* Row 1: Roughness exponent α + classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ir_row + 1, ir_col, irbdr, irbg);
+        {
+            int n = sprintf(p, " \033[38;2;120;200;210m\xce\xb1: %s%.3f %s",
+                            ir_class_clr, ir_alpha, ir_class_str);
+            p += n;
+            int used = 28;
+            for (int i = used; i < ir_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", irbdr, irrst);
+
+        /* Row 2: Interface width + boundary count */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ir_row + 2, ir_col, irbdr, irbg);
+        {
+            int n = sprintf(p, " \033[38;2;100;170;180mw=%.2f"
+                               " \033[38;2;80;130;140mbnd=%d"
+                               " \033[38;2;70;110;120mR\xc2\xb2=%.2f",
+                            ir_total_width, ir_n_boundary, ir_alpha_r2);
+            p += n;
+            int used = 32;
+            for (int i = used; i < ir_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", irbdr, irrst);
+
+        /* Row 3: Fractal dimension + growth exponent β */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ir_row + 3, ir_col, irbdr, irbg);
+        {
+            int n = sprintf(p, " \033[38;2;100;170;180md\xe2\x82\x93=%.3f"
+                               " \033[38;2;160;140;100m\xce\xb2=%.3f",
+                            ir_fractal_dim, ir_beta);
+            p += n;
+            int used = 22;
+            for (int i = used; i < ir_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", irbdr, irrst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ir_row + 4, ir_col, irbdr, irbg);
+        p += sprintf(p, " \033[38;2;20;50;55m");
+        for (int i = 1; i < ir_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", irbdr, irrst);
+
+        /* Row 5: Multi-scale w(ℓ) display */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ir_row + 5, ir_col, irbdr, irbg);
+        {
+            int n = sprintf(p, " \033[38;2;80;130;140mw(\xe2\x84\x93):");
+            p += n;
+            for (int si = 0; si < IR_N_SCALES && si < 5; si++) {
+                if (ir_w[si] > 0.0f) {
+                    n = sprintf(p, "\033[38;2;60;160;170m%.1f", ir_w[si]);
+                } else {
+                    n = sprintf(p, "\033[38;2;50;60;60m-");
+                }
+                p += n;
+                if (si < 4) *p++ = ' ';
+            }
+            int used = 34;
+            for (int i = used; i < ir_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", irbdr, irrst);
+
+        /* Row 6: Color scale legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ir_row + 6, ir_col, irbdr, irbg);
+        {
+            int n = sprintf(p, " \033[38;2;30;170;200m\xe2\x96\x88"
+                               "\033[38;2;120;200;130m\xe2\x96\x88"
+                               "\033[38;2;210;180;40m\xe2\x96\x88"
+                               "\033[38;2;250;80;20m\xe2\x96\x88"
+                               "\033[38;2;250;240;230m\xe2\x96\x88"
+                               "\033[38;2;100;160;170m smooth\xe2\x86\x90 \xe2\x86\x92" "rough [^V]");
+            p += n;
+            int used = 34;
+            for (int i = used; i < ir_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", irbdr, irrst);
+
+        /* Rows 7-8: Sparklines — w(t) and α(t) */
+        for (int sp = 0; sp < 2; sp++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         ir_row + 7 + sp, ir_col, irbdr, irbg);
+            const char *spark_blocks[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                          "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                          "\xe2\x96\x87","\xe2\x96\x88"};
+            float *hist = (sp == 0) ? ir_hist_w : ir_hist_alpha;
+            const char *label = (sp == 0) ? " w " : " \xce\xb1 ";
+            const char *clr = (sp == 0) ? "\033[38;2;60;180;200m" : "\033[38;2;200;160;60m";
+            int n = sprintf(p, " \033[38;2;50;80;90m%-3s%s", label, clr);
+            p += n;
+            int spark_w = ir_pw - 7;
+
+            /* Find max for normalization */
+            float sp_max = 0.01f;
+            for (int i = 0; i < ir_hist_count; i++) {
+                int idx2 = (ir_hist_idx - ir_hist_count + i + IR_HIST_LEN) % IR_HIST_LEN;
+                float hv = hist[idx2];
+                if (sp == 1) hv = fabsf(hv);  /* α can be negative */
+                if (hv > sp_max) sp_max = hv;
+            }
+
+            for (int i = 0; i < spark_w && i < IR_HIST_LEN; i++) {
+                int idx2 = (ir_hist_idx - ir_hist_count + i + IR_HIST_LEN) % IR_HIST_LEN;
+                if (i >= ir_hist_count) {
+                    *p++ = ' ';
+                } else {
+                    float v = hist[idx2];
+                    if (sp == 1) v = fabsf(v);
+                    v = v / sp_max;
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    int bi = (int)(v * 7.0f);
+                    if (bi > 7) bi = 7;
+                    const char *blk = spark_blocks[bi];
+                    while (*blk) *p++ = *blk++;
+                }
+            }
+            int used = spark_w + 5;
+            for (int i = used; i < ir_pw - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", irbdr, irrst);
+        }
+
+        /* Bottom border */
+        int ir_bottom = ir_row + 9;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", ir_bottom, ir_col, irbdr);
+        for (int i = 0; i < ir_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", irrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -19562,6 +20148,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (fi_mode && fi_count >= 16) pc_row += 11;
         if (sg2_mode)       pc_row += 9;
         if (su_mode)        pc_row += 9;
+        if (ir_mode)        pc_row += 10;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -22914,6 +23501,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == 22) { /* Ctrl-V: Interface Roughness Analyzer */
+            if (!ecosystem_mode) {
+                ir_mode = !ir_mode;
+                if (ir_mode) {
+                    ir_reset();
+                    flash_set("Roughness: \xce\xb1 exponent + KPZ universality [^V]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Roughness off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -23656,6 +24256,27 @@ int main(int argc, char **argv) {
         if (mf_mode && running && (generation % 2 == 0)) {
             if (mf_stale) {
                 mf_compute();
+            }
+        }
+
+        /* Interface Roughness: recompute every 4 generations */
+        if (ir_mode && running && (generation % 4 == 0)) {
+            if (ir_stale) {
+                ir_compute();
+            }
+        }
+
+        /* Spectral Gap: accumulate transitions every frame */
+        if (sg2_mode && running) {
+            if (sg2_stale) {
+                sg2_compute();
+            }
+        }
+
+        /* Susceptibility: accumulate density data every frame */
+        if (su_mode && running) {
+            if (su_stale) {
+                su_compute();
             }
         }
 
