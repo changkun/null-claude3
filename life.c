@@ -91,6 +91,9 @@
  *   ;           Toggle Hamiltonian energy landscape (Ising spin analogy)
  *                 Maps alive/dead → spin ±1; H = -s·Σs_neighbors
  *                 Blue=energy well (stable), red=frustrated (domain wall)
+ *   "           Toggle geodesic distance field (click to set seed)
+ *                 BFS shortest-path through live cell network
+ *                 White=seed, cyan→green→yellow→red by distance, gray=isolated
  *   K           Toggle spacetime kymograph (1D slice through time)
  *                 Y-axis=time (scrolling up), X-axis=space (scan row)
  *                 Arrow Up/Down to move scan row; gliders appear as diagonals
@@ -837,6 +840,34 @@ static void cm_reset(void) {
             cm_corr[i][j] = (i == j) ? 1.0f : 0.0f;
 }
 
+/* ── Geodesic Distance Field ─────────────────────────────────────────────── */
+/* Treats all living cells as nodes in an 8-connected graph.  BFS from a
+   user-selected seed cell computes shortest-path (geodesic) distance through
+   the living structure.  Reveals connectivity topology: bottlenecks, bridges,
+   isolated archipelagos, and network diameter.
+   Toggle with '"' key, then left-click to place/move the seed.
+   Colors: seed (white) → near (cyan) → mid (green/yellow) → far (red/magenta).
+   Dead cells and unreachable live cells remain dark. */
+
+#define GD_MAX_DIST 9999   /* sentinel for unreachable */
+
+static int   gd_mode = 0;           /* 0=off, 1=awaiting click, 2=active */
+static int   gd_stale = 1;
+static int   gd_seed_x = -1;        /* seed cell x */
+static int   gd_seed_y = -1;        /* seed cell y */
+static int   gd_dist[MAX_H][MAX_W]; /* BFS distance (-1=dead/unreachable) */
+static int   gd_max_reached = 0;    /* max finite distance found */
+static int   gd_reachable = 0;      /* number of reachable cells */
+static int   gd_components = 0;     /* connected components touching seed's component */
+static int   gd_diameter = 0;       /* eccentricity from seed */
+static float gd_mean_dist = 0.0f;   /* mean distance of reachable cells */
+
+/* BFS queue (static allocation) */
+static int   gd_qx[MAX_W * MAX_H];
+static int   gd_qy[MAX_W * MAX_H];
+
+static void  gd_compute(void);
+
 /* ── Spacetime Kymograph ─────────────────────────────────────────────────── */
 /* Displays a 1D horizontal slice of the grid evolving over time as a 2D
    spacetime diagram.  Y-axis = time (scrolling upward), X-axis = grid row.
@@ -872,7 +903,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 25
+#define N_SPLIT_OVERLAYS 26
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -904,6 +935,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Ising",         ';' },  /* 22 */
     { "Persistence",   ':' },  /* 23 */
     { "CorrMatrix",   '\'' },  /* 24 */
+    { "Geodesic",     '"'  },  /* 25 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -960,7 +992,7 @@ static void split_set_overlay(int idx) {
     surp_mode = 0; mi_mode = 0; cplx_mode = 0; topo_mode = 0;
     rg_mode = 0; kc_mode = 0; corr_mode = 0; eprod_mode = 0;
     wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
-    perc_mode = 0; ising_mode = 0; pb_mode = 0; cm_mode = 0;
+    perc_mode = 0; ising_mode = 0; pb_mode = 0; cm_mode = 0; gd_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -988,6 +1020,7 @@ static void split_set_overlay(int idx) {
         case 22: ising_mode = 1; break;
         case 23: pb_mode = 1; break;
         case 24: cm_mode = 1; break;
+        case 25: gd_mode = 2; break;
     }
 }
 
@@ -1016,6 +1049,7 @@ static int split_detect_current(void) {
     if (ising_mode) return 22;
     if (pb_mode) return 23;
     if (cm_mode) return 24;
+    if (gd_mode) return 25;
     return 0;
 }
 
@@ -2035,6 +2069,7 @@ static void grid_step(void) {
     perc_stale = 1;
     pb_stale = 1;
     ising_stale = 1;
+    gd_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -2729,6 +2764,7 @@ static void demo_reset_overlays(void) {
     pb_mode = 0;
     pp_mode = 0;
     cm_mode = 0;
+    gd_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -6266,6 +6302,113 @@ static RGB ising_to_rgb(float H_norm) {
     }
 }
 
+/* ── Geodesic Distance Field computation ──────────────────────────────────── */
+/* BFS from seed through 8-connected live cells.  O(W*H) worst case. */
+
+static void gd_compute(void) {
+    /* Initialize all distances to -1 (unreachable/dead) */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            gd_dist[y][x] = -1;
+
+    gd_max_reached = 0;
+    gd_reachable = 0;
+    gd_diameter = 0;
+    gd_mean_dist = 0.0f;
+
+    if (gd_seed_x < 0 || gd_seed_y < 0 || gd_seed_x >= W || gd_seed_y >= H)
+        return;
+    if (!grid[gd_seed_y][gd_seed_x]) {
+        /* Seed on dead cell — find nearest live cell as fallback */
+        int best_d2 = W * W + H * H;
+        int bx = -1, by = -1;
+        int sr = 10; /* search radius */
+        for (int dy = -sr; dy <= sr; dy++) {
+            for (int dx = -sr; dx <= sr; dx++) {
+                int nx = gd_seed_x + dx, ny = gd_seed_y + dy;
+                if (nx >= 0 && nx < W && ny >= 0 && ny < H && grid[ny][nx]) {
+                    int d2 = dx * dx + dy * dy;
+                    if (d2 < best_d2) { best_d2 = d2; bx = nx; by = ny; }
+                }
+            }
+        }
+        if (bx < 0) return; /* no live cells nearby */
+        gd_seed_x = bx;
+        gd_seed_y = by;
+    }
+
+    /* BFS */
+    int qh = 0, qt = 0;
+    gd_dist[gd_seed_y][gd_seed_x] = 0;
+    gd_qx[qt] = gd_seed_x;
+    gd_qy[qt] = gd_seed_y;
+    qt++;
+
+    long long sum_dist = 0;
+
+    while (qh < qt) {
+        int cx = gd_qx[qh], cy = gd_qy[qh];
+        int cd = gd_dist[cy][cx];
+        qh++;
+
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                int nx = cx + dx, ny = cy + dy;
+                if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                if (!grid[ny][nx]) continue; /* dead cell — not traversable */
+                if (gd_dist[ny][nx] >= 0) continue; /* already visited */
+                gd_dist[ny][nx] = cd + 1;
+                gd_qx[qt] = nx;
+                gd_qy[qt] = ny;
+                qt++;
+                if (cd + 1 > gd_max_reached) gd_max_reached = cd + 1;
+                sum_dist += cd + 1;
+            }
+        }
+    }
+
+    gd_reachable = qt; /* total BFS-visited cells (including seed) */
+    gd_diameter = gd_max_reached;
+
+    /* Count total live cells to determine component isolation */
+    int total_live = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x]) total_live++;
+    gd_components = total_live - gd_reachable; /* unreachable live cells */
+
+    gd_mean_dist = gd_reachable > 1 ? (float)sum_dist / (float)(gd_reachable - 1) : 0.0f;
+
+    gd_stale = 0;
+}
+
+/* Geodesic distance to RGB:
+   White (seed) → cyan (near) → green (mid) → yellow → red (far) → magenta (very far)
+   Normalized by max distance so full spectrum is always used. */
+static RGB gd_to_rgb(int dist) {
+    if (dist <= 0) return (RGB){255, 255, 255}; /* seed = white */
+    float t = gd_max_reached > 0 ? (float)dist / (float)gd_max_reached : 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    /* 5-stop gradient: cyan → green → yellow → red → magenta */
+    unsigned char r, g, b;
+    if (t < 0.25f) {
+        float s = t * 4.0f;
+        r = 0; g = (unsigned char)(220 + 35 * s); b = (unsigned char)(255 * (1.0f - s));
+    } else if (t < 0.5f) {
+        float s = (t - 0.25f) * 4.0f;
+        r = (unsigned char)(255 * s); g = (unsigned char)(255); b = 0;
+    } else if (t < 0.75f) {
+        float s = (t - 0.5f) * 4.0f;
+        r = 255; g = (unsigned char)(255 * (1.0f - s)); b = 0;
+    } else {
+        float s = (t - 0.75f) * 4.0f;
+        r = 255; g = 0; b = (unsigned char)(200 * s);
+    }
+    return (RGB){r, g, b};
+}
+
 /* ── Topological Persistence Barcode computation ─────────────────────────── */
 /* Each generation: label connected components, match to previous frame via
    spatial overlap, track birth/death of each feature across time. */
@@ -6970,6 +7113,7 @@ static void split_ensure_computed(int idx) {
         case 22: if (ising_stale) ising_compute(); break;
         case 23: if (pb_stale) pb_compute(); break;
         case 24: if (cm_stale && cm_count >= 4) cm_compute(); break;
+        case 25: if (gd_stale && gd_seed_x >= 0) gd_compute(); break;
         default: break;
     }
 }
@@ -8583,6 +8727,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Geodesic distance field overlay */
+    if (gd_mode >= 2) {
+        int d = gd_dist[y][x];
+        if (d >= 0) {
+            *out = gd_to_rgb(d);
+            return 1;
+        }
+        if (grid[y][x]) {
+            /* Live but unreachable — dim gray */
+            out->r = 40; out->g = 40; out->b = 50;
+            return 1;
+        }
+        return 0;
+    }
+
     /* Hamiltonian energy landscape (Ising analogy) overlay */
     if (ising_mode) {
         float H = ising_energy[y][x];
@@ -8850,6 +9009,15 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[38;2;200;140;60m\xe2\x97\x87" "CONE:(%d,%d)\033[0m",
                  cone_sel_x, cone_sel_y);
 
+    /* Geodesic distance field indicator */
+    char gd_str[96] = "";
+    if (gd_mode == 1)
+        snprintf(gd_str, sizeof(gd_str),
+                 " \033[38;2;0;220;200m\xe2\x97\x88GEO:?\033[0m");
+    else if (gd_mode == 2)
+        snprintf(gd_str, sizeof(gd_str),
+                 " \033[38;2;0;220;200m\xe2\x97\x88GEO:d%d\033[0m", gd_diameter);
+
     /* Surprise field indicator */
     char surp_str[96] = "";
     if (surp_mode)
@@ -9074,9 +9242,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -9129,7 +9297,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     int split_saved_surp, split_saved_mi, split_saved_cplx, split_saved_topo;
     int split_saved_rg, split_saved_kc, split_saved_corr, split_saved_eprod;
     int split_saved_wave, split_saved_vort, split_saved_ergo, split_saved_census;
-    int split_saved_perc, split_saved_ising, split_saved_pb;
+    int split_saved_perc, split_saved_ising, split_saved_pb, split_saved_gd;
     int split_mid = view_w / 2; /* column divider position */
 
     if (split_mode) {
@@ -9147,6 +9315,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         split_saved_perc = perc_mode;
         split_saved_ising = ising_mode;
         split_saved_pb = pb_mode;
+        split_saved_gd = gd_mode;
 
         /* Ensure data is computed for both panels */
         split_ensure_computed(split_left);
@@ -9405,6 +9574,7 @@ static void render(int running, int speed_ms, int draw_mode) {
             perc_mode = split_saved_perc;
             ising_mode = split_saved_ising;
             pb_mode = split_saved_pb;
+            gd_mode = split_saved_gd;
         } else {
         /* Normal (non-split) rendering */
         for (int row = 0; row < usable_rows && row < view_h; row++) {
@@ -13002,6 +13172,138 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", pbrst);
     }
 
+    /* ── Geodesic Distance Field overlay panel ─────────────────────────── */
+    if (gd_mode >= 2 && gd_seed_x >= 0) {
+        int gd_w = 46;
+        int gd_col = term_cols - gd_w - 2;
+        int gd_row_p = 3;
+        if (entropy_mode)   gd_row_p += 8;
+        if (temp_mode)      gd_row_p += 9;
+        if (lyapunov_mode)  gd_row_p += 8;
+        if (fourier_mode)   gd_row_p += 18;
+        if (fractal_mode)   gd_row_p += 11;
+        if (wolfram_mode)   gd_row_p += 14;
+        if (flow_mode)      gd_row_p += 9;
+        if (attractor_mode) gd_row_p += 8;
+        if (cone_mode >= 1) gd_row_p += 8;
+        if (surp_mode)      gd_row_p += 8;
+        if (mi_mode)        gd_row_p += 12;
+        if (cplx_mode)      gd_row_p += 11;
+        if (topo_mode)      gd_row_p += 11;
+        if (rg_mode)        gd_row_p += 11;
+        if (kc_mode)        gd_row_p += 9;
+        if (corr_mode)      gd_row_p += 9;
+        if (eprod_mode)     gd_row_p += 9;
+        if (vort_mode)      gd_row_p += 9;
+        if (wave_mode)      gd_row_p += 9;
+        if (ergo_mode)      gd_row_p += 10;
+        if (perc_mode)      gd_row_p += 10;
+        if (ising_mode)     gd_row_p += 10;
+        if (pb_mode)        gd_row_p += 14;
+        if (gd_col < 1) gd_col = 1;
+
+        const char *gdbdr = "\033[38;2;0;200;180;48;2;8;15;20m";
+        const char *gdbg  = "\033[48;2;8;15;20m";
+        const char *gdrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x97\x88 Geodesic Distance Field ",
+                     gd_row_p, gd_col, gdbdr);
+        for (int i = 27; i < gd_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", gdrst);
+
+        /* Row 1: Seed location & diameter */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     gd_row_p + 1, gd_col, gdbdr, gdbg);
+        p += sprintf(p, " \033[38;2;255;255;255mSeed:(%d,%d)",
+                     gd_seed_x, gd_seed_y);
+        p += sprintf(p, "\033[38;2;100;160;160m  diam:");
+        p += sprintf(p, "\033[38;2;255;180;60m%d", gd_diameter);
+        { int used = 26 + (gd_seed_x >= 100 ? 1 : 0) + (gd_seed_x >= 10 ? 1 : 0)
+                       + (gd_seed_y >= 100 ? 1 : 0) + (gd_seed_y >= 10 ? 1 : 0)
+                       + (gd_diameter >= 100 ? 1 : 0) + (gd_diameter >= 10 ? 1 : 0);
+          for (int i = used; i < gd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", gdbdr, gdrst);
+
+        /* Row 2: Reachable & isolated */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     gd_row_p + 2, gd_col, gdbdr, gdbg);
+        p += sprintf(p, " \033[38;2;0;220;200mReach:\033[38;2;100;255;200m%d",
+                     gd_reachable);
+        p += sprintf(p, "\033[38;2;100;160;160m  isol:");
+        p += sprintf(p, "\033[38;2;180;80;80m%d", gd_components);
+        { int used = 24 + (gd_reachable >= 1000 ? 1 : 0) + (gd_reachable >= 100 ? 1 : 0)
+                       + (gd_reachable >= 10 ? 1 : 0)
+                       + (gd_components >= 1000 ? 1 : 0) + (gd_components >= 100 ? 1 : 0)
+                       + (gd_components >= 10 ? 1 : 0);
+          for (int i = used; i < gd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", gdbdr, gdrst);
+
+        /* Row 3: Mean distance */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     gd_row_p + 3, gd_col, gdbdr, gdbg);
+        p += sprintf(p, " \033[38;2;180;200;160m\xc4\x8f=%.1f", gd_mean_dist);
+        p += sprintf(p, "\033[38;2;100;160;160m  [click to reseed]");
+        { int used = 30 + (gd_mean_dist >= 100.0f ? 1 : 0) + (gd_mean_dist >= 10.0f ? 1 : 0);
+          for (int i = used; i < gd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", gdbdr, gdrst);
+
+        /* Row 4: Distance distribution bar (mini histogram) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     gd_row_p + 4, gd_col, gdbdr, gdbg);
+        p += sprintf(p, " ");
+        {
+            /* 8-bin histogram of distances */
+            int bins[8] = {0};
+            float bin_w = gd_max_reached > 0 ? (float)(gd_max_reached + 1) / 8.0f : 1.0f;
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    if (gd_dist[y][x] > 0) {
+                        int b = (int)((float)gd_dist[y][x] / bin_w);
+                        if (b >= 8) b = 7;
+                        bins[b]++;
+                    }
+            int max_bin = 1;
+            for (int i = 0; i < 8; i++) if (bins[i] > max_bin) max_bin = bins[i];
+
+            const char *bars[] = {" ", "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83",
+                                  "\xe2\x96\x85", "\xe2\x96\x86", "\xe2\x96\x87", "\xe2\x96\x88"};
+            for (int i = 0; i < 8; i++) {
+                int level = max_bin > 0 ? (bins[i] * 7 + max_bin / 2) / max_bin : 0;
+                if (level > 7) level = 7;
+                /* Color from cyan to red */
+                float t = (float)i / 7.0f;
+                int cr = (int)(255 * t);
+                int cg = (int)(200 * (1.0f - t));
+                int cb = (int)(200 * (1.0f - t));
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s%s%s%s%s",
+                             cr, cg, cb,
+                             bars[level], bars[level], bars[level], bars[level], bars[level]);
+            }
+        }
+        { int used = 41; for (int i = used; i < gd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", gdbdr, gdrst);
+
+        /* Row 5: Legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     gd_row_p + 5, gd_col, gdbdr, gdbg);
+        p += sprintf(p, " \033[38;2;255;255;255m\xe2\x97\x8f\033[38;2;100;120;120mseed"
+                     " \033[38;2;0;220;255m\xe2\x96\x88\033[38;2;100;120;120mnear"
+                     " \033[38;2;0;255;0m\xe2\x96\x88\033[38;2;100;120;120mmid"
+                     " \033[38;2;255;255;0m\xe2\x96\x88\033[38;2;100;120;120mfar"
+                     " \033[38;2;255;0;0m\xe2\x96\x88\033[38;2;100;120;120mvfar"
+                     " \033[38;2;40;40;50m\xe2\x96\x88\033[38;2;100;120;120misol");
+        { int used = 40; for (int i = used; i < gd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", gdbdr, gdrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", gd_row_p + 6, gd_col, gdbdr);
+        for (int i = 0; i < gd_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", gdrst);
+    }
+
     /* ── Phase Portrait overlay panel ────────────────────────────────────── */
     if (pp_mode && pp_hist_count > 1) {
         int pp_w = 44;  /* panel width in terminal columns */
@@ -13031,6 +13333,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (perc_mode)     pp_row += 10;
         if (ising_mode)    pp_row += 10;
         if (pb_mode)       pp_row += 14;
+        if (gd_mode >= 2)  pp_row += 8;
         if (pp_col < 1) pp_col = 1;
 
         /* Braille canvas: 30 chars wide × 12 chars tall = 60×48 dots */
@@ -13249,6 +13552,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (perc_mode)     cm_row += 10;
         if (ising_mode)    cm_row += 10;
         if (pb_mode)       cm_row += 14;
+        if (gd_mode >= 2)  cm_row += 8;
         if (pp_mode)       cm_row += 18;
         if (cm_col < 1) cm_col = 1;
 
@@ -14534,6 +14838,18 @@ int main(int argc, char **argv) {
                 printf("\033[2J"); fflush(stdout);
             }
         }
+        else if (key == '"') {
+            if (gd_mode > 0) {
+                gd_mode = 0;
+                flash_set("Geodesic Distance off");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                gd_mode = 1; /* waiting for click */
+                gd_seed_x = -1;
+                gd_seed_y = -1;
+                flash_set("Geodesic: click a live cell to set seed [\"]exit");
+            }
+        }
         else if (key == '\\') {
             split_mode = !split_mode;
             if (split_mode) {
@@ -14834,6 +15150,18 @@ int main(int argc, char **argv) {
                     probe_mode = 0;
                     probe_x = probe_y = -1;
                     printf("\033[2J"); fflush(stdout);
+                } else if (gd_mode >= 1 && m->type == 1 && (btn & 0x03) == 0) {
+                    /* Geodesic distance: left-click selects seed cell */
+                    if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
+                        gd_seed_x = gx;
+                        gd_seed_y = gy;
+                        gd_compute();
+                        gd_mode = 2;
+                        char msg[64];
+                        snprintf(msg, sizeof(msg), "Geodesic: seed(%d,%d) reach=%d diam=%d",
+                                 gd_seed_x, gd_seed_y, gd_reachable, gd_diameter);
+                        flash_set(msg);
+                    }
                 } else if (cone_mode >= 1 && m->type == 1 && (btn & 0x03) == 0) {
                     /* Light cone: left-click selects target cell */
                     if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
@@ -15109,6 +15437,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh persistence barcode every 2 generations */
         if (pb_mode && pb_stale && (generation % 2 == 0 || !running)) {
             pb_compute();
+        }
+
+        /* Auto-refresh geodesic distance field every 2 generations */
+        if (gd_mode == 2 && gd_stale && gd_seed_x >= 0 && (generation % 2 == 0 || !running)) {
+            gd_compute();
         }
 
         /* Auto-refresh wave mechanics every generation (continuous propagation) */
