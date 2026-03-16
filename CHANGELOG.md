@@ -1,8 +1,22 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~13,622 lines
-(Round 50).
+features. The project grew from ~790 lines (Round 1) to ~13,953 lines
+(Round 51).
+
+## Round 51 — Hamiltonian Energy Landscape
+
+Ising spin model analogy for the automaton. Press `;` to visualize
+per-cell Hamiltonian energy H = -s·Σs_neighbors where alive=+1, dead=-1.
+Deep blue = energy wells (stable, aligned still lifes), cyan = shallow
+wells, yellow/orange = mild frustration at boundaries, bright red =
+strongly frustrated domain walls. Sidebar shows total energy H,
+magnetization m, susceptibility χ (peaks at phase transitions), domain
+wall count/density, energy sparkline, and phase classification
+(Ordered/Critical/Disordered/Paramagnetic). Explains *why* certain
+structures are stable from a statistical mechanics perspective — still
+lifes sit in deep energy minima, chaotic regions are frustrated
+high-energy states. +385 lines.
 
 ## Round 50 — Spacetime Kymograph Mode
 

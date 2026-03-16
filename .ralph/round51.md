@@ -1,51 +1,42 @@
-# Round 51: Hamiltonian Energy Landscape (Ising Model Analogy)
+# Round 51: Hamiltonian Energy Landscape Overlay
 
 ## Goal
-Add an Ising-model energy overlay that maps alive/dead cells to spin ±1,
-computes per-cell Hamiltonian energy H = -s·Σs_neighbors, and visualizes
-the energy landscape revealing stable structures (energy wells) vs
-frustrated boundaries (domain walls).
+Add a statistical mechanics overlay that treats the automaton as an Ising spin system, mapping alive/dead cells to +1/-1 spins and computing per-cell Hamiltonian energy H = -s·Σs_neighbors. Visualize the result as a continuous energy landscape revealing why certain structures are stable from a physics perspective.
 
 ## What was built
-- **Toggle**: `;` key activates the Ising Energy Landscape overlay
-- **Physics**: Each cell treated as spin s_i = +1 (alive) or -1 (dead).
-  Hamiltonian H_i = -s_i · Σ s_neighbors over Moore neighborhood (8 neighbors).
-  Normalized to [-1, +1] range for visualization.
-- **Color scheme**: Deep blue (energy well, H < 0, aligned neighbors) →
-  cyan (shallow well) → yellow/orange (mild frustration) → bright red
-  (strongly frustrated, H > 0)
-- **Magnetization** m = mean spin across grid: +1 = all alive, -1 = all dead
-- **Susceptibility** χ = variance of local magnetization (peaks at criticality)
-- **Domain walls**: Count of misaligned neighbor pairs (phase boundaries)
-- **Frustrated cells**: Count of cells with positive energy (locally unfavorable)
-- **Sidebar panel**: Total H, m, χ, domain wall count + density %, color legend,
-  energy sparkline (30 frames), phase classification
-- **Phase classification**: Ordered (ferromagnetic), Partially ordered,
-  Critical (high χ), Disordered (paramagnetic), Mixed phase
 
-## Integration points
-- Split overlay table: index 22, key `;`
-- split_set_overlay, split_detect_current, split_ensure_computed
-- split-screen save/restore variables
-- demo_reset_overlays, demo_setup_scene
-- Stale flag in update(), auto-refresh every 2 generations
-- Cell color rendering with brightened alive cells
-- Forward declaration for ising_compute()
+### Hamiltonian Energy Landscape (Toggle: `;`)
+- **Ising spin mapping**: Alive cells → spin +1, dead cells → spin -1
+- **Per-cell energy**: H = -s·Σs_neighbors computed over the 8-cell Moore neighborhood
+- **Energy landscape coloring**:
+  - Deep blue = energy wells (stable, aligned structures like still lifes)
+  - Cyan = shallow wells (partially stable configurations)
+  - Yellow/orange = mild frustration (boundary regions)
+  - Bright red = strongly frustrated (domain walls, unstable configurations)
 
-## Insights
-- Still lifes (blocks, beehives) sit in deep energy wells — all neighbors
-  aligned → minimum H → explains their stability thermodynamically
-- Oscillators cycle between energy states, visible as breathing blue/yellow
-- Random initial conditions show paramagnetic disorder (low |m|, moderate χ)
-- Conway's Life tends toward low-energy configurations over time as
-  unstable structures decay — visible as the grid "cools" in the energy map
-- Domain walls trace exact boundaries between alive/dead regions,
-  highlighting the geometric structure of pattern boundaries
-- Susceptibility χ spikes during phase transitions (randomization → settling)
+### Sidebar Stats Panel
+- **Total energy H**: Sum of all per-cell Hamiltonian values
+- **Magnetization m**: Net spin alignment (fraction of +1 vs -1)
+- **Susceptibility χ**: Variance-based measure that peaks at phase transitions
+- **Domain wall count/density**: Number and density of frustrated neighbor pairs
+- **Energy sparkline**: Rolling history of total energy over time
+- **Phase classification**: Ordered / Critical / Disordered / Paramagnetic based on magnetization and susceptibility
 
-## Type: Exploration (91%)
-New analytical lens from statistical mechanics / condensed matter physics.
-Complements existing thermodynamic overlays (entropy production, ergodicity,
-temperature field) by providing the missing energy/stability perspective.
+### Key insight
+This overlay explains *why* certain structures are stable from a statistical mechanics perspective. Still lifes sit in deep energy minima (all neighbors aligned), while chaotic regions are frustrated high-energy states that the system "wants" to relax away from. Domain walls — boundaries between ordered regions — show up as bright red lines of maximum frustration.
 
-## Lines added: ~230
+### Integration
+- Overlay index 22, accessible via `;` key
+- Full split-screen support as a dual-comparison overlay
+- Status bar indicator showing active state
+- Help bar updated with key hint
+- Clean compilation with existing flags
+
+## Technical notes
+- Pure Ising model analogy — no actual spin dynamics, just energy evaluation of the CA state
+- The coupling constant J is implicitly +1 (ferromagnetic), so aligned neighbors lower energy
+- Susceptibility computed via χ = (⟨m²⟩ - ⟨m⟩²) / N, tracking variance over a rolling window
+- Domain walls detected by counting neighbor pairs with opposite spin signs
+
+## Lines added
+~385 lines (overlay rendering, energy computation, stats panel, key handling, status integration)
