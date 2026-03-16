@@ -88,7 +88,7 @@ Load an RLE pattern file:
 | Category | Features |
 |----------|----------|
 | **Simulation** | 10 rule presets, live mutation, multi-rule zones, emitters/absorbers, wormhole portals, dual-species ecosystems, temperature field |
-| **Analysis** | Shannon entropy, Lyapunov exponents, 2D FFT, fractal dimension, frequency detection, Wolfram classification, transfer entropy, phase-space attractors, causal light cones, prediction surprise, mutual information, composite complexity, topological features, renormalization group, Kolmogorov complexity, spatial correlation length |
+| **Analysis** | Shannon entropy, Lyapunov exponents, 2D FFT, fractal dimension, frequency detection, Wolfram classification, transfer entropy, phase-space attractors, causal light cones, prediction surprise, mutual information, composite complexity, topological features, renormalization group, Kolmogorov complexity, spatial correlation length, anomaly detector |
 | **Interaction** | Mouse drawing, zoom/pan, kaleidoscope symmetry, pattern stamps, genetic rule search, time-travel replay |
 | **Visualization** | 24-bit true-color heatmaps, ghost trails, signal tracer, population sparkline, minimap, auto-demo mode |
 | **I/O** | Binary save/load, RLE import/export, PPM screenshots, timeline animation export |
@@ -175,6 +175,7 @@ Load an RLE pattern file:
 | `^` | Kolmogorov complexity (LZ77 compression) |
 | `&` | Spatial correlation length (two-point correlation ξ) |
 | `?` | Cell probe inspector (all metrics for clicked cell) |
+| `8` | Anomaly detector (statistical watchdog for all 16 metrics) |
 
 #### File I/O
 

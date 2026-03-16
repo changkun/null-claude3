@@ -4,6 +4,21 @@ Development history organized by round. Each round adds one or two major
 features. The project grew from ~790 lines (Round 1) to ~14,830 lines
 (Round 53).
 
+## Round 59 — Anomaly Detector
+
+Real-time statistical watchdog that monitors all 16 scalar metrics for
+anomalous deviations.  Press `8` to cycle through off → watch → watch+auto-pause.
+Maintains running mean and variance over a 128-frame sliding window using
+Welford-style accumulation.  When any metric exceeds the Z-score threshold
+(default 2.0σ, adjustable with +/−), fires a red alert bar showing metric name,
+direction (↑/↓), and Z-score magnitude.  Up to 4 simultaneous alerts displayed
+with auto-expiry after ~1 second.  In auto-pause mode, halts the simulation
+when any metric exceeds 3.5σ — catches phase transitions, glider gun formation,
+symmetry breaking, and other rare dynamical events.  Status indicator shows
+green (quiet) or red (alert) with total event count.  Pure exploitation round —
+no new analysis math, wires existing metric infrastructure into a practical
+discovery tool.  ~100 lines.
+
 ## Round 53 — Phase Portrait Mode
 
 Dynamical systems visualization for the automaton. Press `)` to plot any

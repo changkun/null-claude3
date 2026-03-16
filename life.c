@@ -98,6 +98,11 @@
  *                 [</>] cycle X metric, [{/}] cycle Z metric
  *                 Arrow keys rotate camera, [R] toggle auto-rotate
  *   7           Toggle particle tracker (velocity field from component matching)
+ *   8           Toggle anomaly detector (statistical watchdog for all 16 metrics)
+ *                 Cycles: off → watch → watch+auto-pause → off
+ *                 +/- adjust alert threshold (1.0σ–5.0σ, default 2.0σ)
+ *                 Red alert bar flashes when metrics deviate beyond threshold
+ *                 Auto-pause mode halts simulation on critical events (>3.5σ)
  *                 Tracks connected components across frames, computes velocities
  *                 Blue=still, green=slow, yellow=medium, red=fast
  *   K           Toggle spacetime kymograph (1D slice through time)
@@ -1128,6 +1133,57 @@ static int   pt_spark_count = 0;
 
 static void  pt_compute(void);
 
+/* ── Anomaly Detector ─────────────────────────────────────────────────────── */
+/* Real-time watchdog that monitors all 16 scalar metrics for statistical
+   anomalies.  Maintains running mean and variance (Welford's algorithm) over
+   a sliding window.  When any metric deviates > threshold σ from its running
+   mean, fires an alert with metric name and Z-score.  Can optionally auto-pause
+   the simulation on critical events (Z > critical_σ).
+   Toggle with '8' key.  While active, +/- adjusts alert threshold (1.5σ–4.0σ). */
+
+#define AD_WINDOW  128   /* sliding window length for statistics */
+#define AD_N       PP_N_METRICS   /* 16 metrics */
+#define AD_MAX_ALERTS 4  /* max simultaneous alerts shown */
+
+static int   ad_mode = 0;          /* 0=off, 1=on, 2=on+auto-pause */
+static float ad_buf[AD_WINDOW][AD_N]; /* ring buffer of metric snapshots */
+static int   ad_head = 0;          /* next write position */
+static int   ad_count = 0;         /* valid entries (≤ AD_WINDOW) */
+static float ad_mean[AD_N];        /* running mean per metric */
+static float ad_var[AD_N];         /* running variance per metric */
+static float ad_zscore[AD_N];      /* current Z-score per metric */
+static float ad_thresh = 2.0f;     /* alert threshold in σ (adjustable) */
+static float ad_critical = 3.5f;   /* auto-pause threshold */
+
+/* Alert state */
+typedef struct {
+    int   metric;     /* index into pp_metric_table */
+    float zscore;     /* Z-score magnitude */
+    int   direction;  /* +1 = spike up, -1 = spike down */
+    int   age;        /* frames since alert fired */
+} ADAlert;
+
+static ADAlert ad_alerts[AD_MAX_ALERTS];
+static int     ad_n_alerts = 0;
+static int     ad_total_events = 0;  /* total anomalies detected */
+static int     ad_paused_gen = -1;   /* generation where auto-pause fired (-1=none) */
+
+/* Record current metrics and detect anomalies */
+static void ad_record(void);
+/* Reset statistics */
+static void ad_reset(void) {
+    ad_head = 0;
+    ad_count = 0;
+    ad_n_alerts = 0;
+    ad_total_events = 0;
+    ad_paused_gen = -1;
+    for (int i = 0; i < AD_N; i++) {
+        ad_mean[i] = 0.0f;
+        ad_var[i] = 0.0f;
+        ad_zscore[i] = 0.0f;
+    }
+}
+
 /* ── Split-screen function implementations (need census_mode to be declared) ── */
 static void split_set_overlay(int idx) {
     /* Disable all analysis overlays */
@@ -1469,6 +1525,88 @@ static void kymo_record(void) {
     kymo_row_pop[kymo_head] = pop;
     kymo_head = (kymo_head + 1) % KYMO_DEPTH;
     if (kymo_count < KYMO_DEPTH) kymo_count++;
+}
+
+/* ── Anomaly Detector implementation ───────────────────────────────────────── */
+static void ad_record(void) {
+    /* Store current metric snapshot */
+    for (int i = 0; i < AD_N; i++)
+        ad_buf[ad_head][i] = pp_read_metric(i);
+    ad_head = (ad_head + 1) % AD_WINDOW;
+    if (ad_count < AD_WINDOW) ad_count++;
+
+    /* Need minimum data for statistics */
+    if (ad_count < 8) return;
+
+    int n = ad_count;
+
+    /* Compute running mean and variance over the window */
+    for (int i = 0; i < AD_N; i++) {
+        double sum = 0.0, sum2 = 0.0;
+        for (int k = 0; k < n; k++) {
+            int idx = (ad_head - n + k + AD_WINDOW) % AD_WINDOW;
+            double v = ad_buf[idx][i];
+            sum += v;
+            sum2 += v * v;
+        }
+        ad_mean[i] = (float)(sum / n);
+        float var = (float)(sum2 / n - (sum / n) * (sum / n));
+        if (var < 1e-12f) var = 1e-12f;
+        ad_var[i] = var;
+
+        /* Current value is the most recent entry */
+        int cur = (ad_head - 1 + AD_WINDOW) % AD_WINDOW;
+        float val = ad_buf[cur][i];
+        float sigma = sqrtf(ad_var[i]);
+        ad_zscore[i] = (val - ad_mean[i]) / sigma;
+    }
+
+    /* Age existing alerts */
+    for (int i = 0; i < ad_n_alerts; i++) {
+        ad_alerts[i].age++;
+        if (ad_alerts[i].age > 60) {  /* expire after ~1 second */
+            /* Remove by shifting */
+            for (int j = i; j < ad_n_alerts - 1; j++)
+                ad_alerts[j] = ad_alerts[j + 1];
+            ad_n_alerts--;
+            i--;
+        }
+    }
+
+    /* Check for new anomalies */
+    for (int i = 0; i < AD_N; i++) {
+        float az = ad_zscore[i] < 0 ? -ad_zscore[i] : ad_zscore[i];
+        if (az > ad_thresh) {
+            /* Check if this metric already has an active alert */
+            int already = 0;
+            for (int j = 0; j < ad_n_alerts; j++) {
+                if (ad_alerts[j].metric == i) {
+                    /* Update existing alert */
+                    ad_alerts[j].zscore = az;
+                    ad_alerts[j].direction = ad_zscore[i] > 0 ? 1 : -1;
+                    ad_alerts[j].age = 0;
+                    already = 1;
+                    break;
+                }
+            }
+            if (!already && ad_n_alerts < AD_MAX_ALERTS) {
+                /* Insert new alert, sorted by Z-score descending */
+                int pos = ad_n_alerts;
+                for (int j = 0; j < ad_n_alerts; j++) {
+                    if (az > ad_alerts[j].zscore) { pos = j; break; }
+                }
+                /* Shift down */
+                for (int j = ad_n_alerts; j > pos; j--)
+                    ad_alerts[j] = ad_alerts[j - 1];
+                ad_alerts[pos].metric = i;
+                ad_alerts[pos].zscore = az;
+                ad_alerts[pos].direction = ad_zscore[i] > 0 ? 1 : -1;
+                ad_alerts[pos].age = 0;
+                ad_n_alerts++;
+                ad_total_events++;
+            }
+        }
+    }
 }
 
 /* ── Metric Correlation Matrix implementations ────────────────────────────── */
@@ -9627,6 +9765,27 @@ static void render(int running, int speed_ms, int draw_mode) {
                  pt_n_moving, pt_n_particles);
     }
 
+    /* Anomaly detector indicator */
+    char ad_str[128] = "";
+    if (ad_mode) {
+        const char *mode_tag = (ad_mode == 2) ? "WATCH+P" : "WATCH";
+        if (ad_n_alerts > 0) {
+            /* Show top alert with blinking effect */
+            const char *dir = ad_alerts[0].direction > 0 ? "\xe2\x86\x91" : "\xe2\x86\x93";
+            snprintf(ad_str, sizeof(ad_str),
+                     " \033[38;2;255;60;60m\xe2\x9a\xa0%s:%s%s%.1f\xcf\x83\033[0m"
+                     "\033[90m(%d)\033[0m",
+                     mode_tag,
+                     pp_metric_table[ad_alerts[0].metric].name,
+                     dir, ad_alerts[0].zscore, ad_total_events);
+        } else {
+            snprintf(ad_str, sizeof(ad_str),
+                     " \033[38;2;80;220;120m\xe2\x97\x86%s:%.1f\xcf\x83\033[0m"
+                     "\033[90m(%d)\033[0m",
+                     mode_tag, ad_thresh, ad_total_events);
+        }
+    }
+
     /* Split-screen indicator */
     char split_str[128] = "";
     if (split_mode) {
@@ -9773,14 +9932,29 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, rp_str, sa_str, pt_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, rp_str, sa_str, pt_str, ad_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
     if (flash_active()) {
         p += sprintf(p, "  \033[97;42m %s \033[0m", flash_msg);
+    }
+
+    /* Anomaly alert flash bar */
+    if (ad_mode && ad_n_alerts > 0) {
+        p += sprintf(p, "  \033[97;41m \xe2\x9a\xa0 ");
+        for (int ai = 0; ai < ad_n_alerts && ai < 3; ai++) {
+            const char *dir = ad_alerts[ai].direction > 0 ? "\xe2\x86\x91" : "\xe2\x86\x93";
+            /* Intensity based on Z-score: brighter = more extreme */
+            int bright = (int)(155 + ad_alerts[ai].zscore * 20);
+            if (bright > 255) bright = 255;
+            p += sprintf(p, "%s%s%.1f\xcf\x83 ",
+                         pp_metric_table[ad_alerts[ai].metric].name,
+                         dir, ad_alerts[ai].zscore);
+        }
+        p += sprintf(p, "\033[0m");
     }
 
     /* sparkline right after stats */
@@ -9814,7 +9988,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                          "[1-5]pre [d]draw [D]demo [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
                          "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [=]dS/dt [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
-                         "[S]stamp [v]census [?]probe [)]split [K]kymo [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
+                         "[S]stamp [v]census [?]probe [)]split [K]kymo [8]watch [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                          "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
     }
 
@@ -15734,6 +15908,11 @@ int main(int argc, char **argv) {
                 if (temp_brush > 1.0f) temp_brush = 1.0f;
             } else if (emit_mode) {
                 emit_rate = emit_rate > 1 ? emit_rate - 1 : 1;
+            } else if (ad_mode) {
+                ad_thresh += 0.25f;
+                if (ad_thresh > 5.0f) ad_thresh = 5.0f;
+                char tmp[64]; snprintf(tmp, sizeof(tmp), "Alert threshold: %.2f\xcf\x83", ad_thresh);
+                flash_set(tmp);
             } else {
                 speed_ms = speed_ms > 20 ? speed_ms - 20 : 20;
             }
@@ -15747,6 +15926,11 @@ int main(int argc, char **argv) {
                 if (temp_brush < 0.0f) temp_brush = 0.0f;
             } else if (emit_mode) {
                 emit_rate = emit_rate < 20 ? emit_rate + 1 : 20;
+            } else if (ad_mode) {
+                ad_thresh -= 0.25f;
+                if (ad_thresh < 1.0f) ad_thresh = 1.0f;
+                char tmp[64]; snprintf(tmp, sizeof(tmp), "Alert threshold: %.2f\xcf\x83", ad_thresh);
+                flash_set(tmp);
             } else {
                 speed_ms = speed_ms < 1000 ? speed_ms + 20 : 1000;
             }
@@ -16004,6 +16188,20 @@ int main(int argc, char **argv) {
                 printf("\033[2J"); fflush(stdout);
             } else {
                 flash_set("Particle Tracker off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
+        else if (key == '8') {
+            ad_mode = (ad_mode + 1) % 3; /* off → watch → watch+pause → off */
+            if (ad_mode == 1) {
+                ad_reset();
+                flash_set("Anomaly Detector ON (2.0\xcf\x83) [8]cycle [+/-]thresh");
+                printf("\033[2J"); fflush(stdout);
+            } else if (ad_mode == 2) {
+                flash_set("Anomaly Detector +AUTO-PAUSE (3.5\xcf\x83)");
+            } else {
+                ad_reset();
+                flash_set("Anomaly Detector off");
                 printf("\033[2J"); fflush(stdout);
             }
         }
@@ -16669,6 +16867,28 @@ int main(int argc, char **argv) {
         /* 3D attractor: record 3-metric state every 2 generations */
         if (sa_mode && running && (generation % 2 == 0)) {
             sa_record();
+        }
+
+        /* Anomaly detector: record all metrics every 2 generations */
+        if (ad_mode && running && (generation % 2 == 0)) {
+            ad_record();
+            /* Auto-pause on critical anomaly (mode 2 only) */
+            if (ad_mode == 2 && ad_paused_gen != generation) {
+                for (int ai = 0; ai < ad_n_alerts; ai++) {
+                    float az = ad_alerts[ai].zscore;
+                    if (az > ad_critical) {
+                        running = 0;
+                        ad_paused_gen = generation;
+                        char tmp[96];
+                        snprintf(tmp, sizeof(tmp),
+                                 "AUTO-PAUSE: %s %.1f\xcf\x83 at gen %d",
+                                 pp_metric_table[ad_alerts[ai].metric].name,
+                                 az, generation);
+                        flash_set(tmp);
+                        break;
+                    }
+                }
+            }
         }
 
         render(running, speed_ms, draw_mode);
