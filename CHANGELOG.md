@@ -1,8 +1,21 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~18,200 lines
-(Round 63).
+features. The project grew from ~790 lines (Round 1) to ~18,700 lines
+(Round 64).
+
+## Round 64 — Early Warning Signals Overlay
+
+The project's first **predictive** overlay — all 30 previous analysis overlays
+describe current or historical state; this one forecasts regime shifts. Press
+`3` to visualize critical slowing down indicators across the grid. Uses the
+256-frame timeline buffer to compute per-cell lag-1 autocorrelation (AC1) and
+variance, then detects rising trends via Kendall-tau over 8 rolling sub-windows.
+Grid coloring: green (stable) → yellow (caution) → orange (warning) → red
+(critical). Sidebar shows global warning level, top alerting metric with AC1 bar
+chart, Kendall-tau trend indicators (τ_AC, τ_var), sparkline history, and phase
+classification (STABLE/CAUTION/WARNING/CRITICAL). Full split-screen support.
+31st analysis overlay. +547 lines.
 
 ## Round 63 — Causal Emergence Overlay
 
