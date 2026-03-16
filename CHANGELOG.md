@@ -1,8 +1,17 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~11,200 lines
-(Round 43).
+features. The project grew from ~790 lines (Round 1) to ~11,639 lines
+(Round 44).
+
+## Round 44 — Entropy Production Rate
+
+Temporal derivative of local Shannon entropy (dS/dt) overlay. First overlay
+to capture a temporal thermodynamic quantity rather than a spatial snapshot.
+Blue = entropy decreasing (self-organization), red = entropy increasing
+(dissolution), gray = equilibrium. EMA-smoothed for stable tracking. Stats
+panel shows global dS/dt, ordering/disordering fractions, thermodynamic
+phase classification, and sparkline history. Toggle with `=`.
 
 ## Round 43 — Spatial Correlation Length
 
